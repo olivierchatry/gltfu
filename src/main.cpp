@@ -991,12 +991,15 @@ int main(int argc, char** argv) {
             
             gltfu::GltfMerger merger;
             for (size_t i = 0; i < optimInputs.size(); ++i) {
+                double fileProgress = 0.05 + (0.05 * i / optimInputs.size());
+                progress.report("optim", "Merging file " + std::to_string(i + 1) + "/" + std::to_string(optimInputs.size()), fileProgress);
                 if (!merger.loadAndMergeFile(optimInputs[i], false, false)) {
                     progress.error("optim", "Merge failed: " + merger.getError());
                     return 1;
                 }
             }
             
+            progress.report("optim", "Saving merged file", 0.10);
             if (!merger.save(tempFile1, false, false, true, false)) {
                 progress.error("optim", "Failed to save merged file");
                 return 1;
@@ -1009,6 +1012,7 @@ int main(int argc, char** argv) {
         // Step 2: Deduplicate
         if (!optimSkipDedupe) {
             progress.report("optim", "Step 2: Deduplicating resources", 0.15);
+            progress.report("optim", "Loading model for deduplication", 0.16);
             
             tinygltf::Model model;
             std::string err, warn;
@@ -1026,8 +1030,9 @@ int main(int argc, char** argv) {
             dedupOpts.dedupTextures = true;
             dedupOpts.keepUniqueNames = false;
             dedupOpts.verbose = optimVerbose;
-            dedupOpts.progressReporter = optimVerbose ? &progress : nullptr;
+            dedupOpts.progressReporter = &progress;
             
+            progress.report("optim", "Processing deduplication", 0.18);
             if (!deduper.process(model, dedupOpts)) {
                 progress.error("optim", "Deduplication failed: " + deduper.getError());
                 return 1;
@@ -1037,6 +1042,7 @@ int main(int argc, char** argv) {
                 std::cout << "  " << deduper.getStats() << std::endl;
             }
             
+            progress.report("optim", "Saving deduplicated file", 0.25);
             if (!loader.WriteGltfSceneToFile(&model, tempFile2, false, false, true, false)) {
                 progress.error("optim", "Failed to write deduplicated file");
                 return 1;
@@ -1047,6 +1053,7 @@ int main(int argc, char** argv) {
         // Step 3: Flatten scene graph
         if (!optimSkipFlatten) {
             progress.report("optim", "Step 3: Flattening scene graph", 0.30);
+            progress.report("optim", "Loading model for flattening", 0.31);
             
             tinygltf::Model model;
             std::string err, warn;
@@ -1056,12 +1063,14 @@ int main(int argc, char** argv) {
                 return 1;
             }
             
+            progress.report("optim", "Processing scene graph flattening", 0.33);
             int flattenedCount = gltfu::GltfFlatten::process(model, true);
             
             if (optimVerbose) {
                 std::cout << "  Flattened " << flattenedCount << " nodes" << std::endl;
             }
             
+            progress.report("optim", "Saving flattened file", 0.38);
             std::string nextFile = (currentFile == tempFile1) ? tempFile2 : tempFile1;
             if (!loader.WriteGltfSceneToFile(&model, nextFile, false, false, true, false)) {
                 progress.error("optim", "Failed to write flattened file");
@@ -1073,6 +1082,7 @@ int main(int argc, char** argv) {
         // Step 4: Join primitives
         if (!optimSkipJoin) {
             progress.report("optim", "Step 4: Joining compatible primitives", 0.45);
+            progress.report("optim", "Loading model for joining", 0.46);
             
             tinygltf::Model model;
             std::string err, warn;
@@ -1083,15 +1093,17 @@ int main(int argc, char** argv) {
             }
             
             gltfu::GltfJoin joiner;
-            if (!joiner.process(model, false, false)) {
-                progress.error("optim", "Join failed: " + joiner.getError());
+            gltfu::JoinOptions joinOpts;
+            joinOpts.keepMeshes = false;
+            joinOpts.keepNamed = false;
+            
+            progress.report("optim", "Processing primitive joining", 0.48);
+            if (!joiner.process(model, joinOpts)) {
+                progress.error("optim", "Join operation failed");
                 return 1;
             }
             
-            if (optimVerbose && !joiner.getStats().empty()) {
-                std::cout << "  " << joiner.getStats() << std::endl;
-            }
-            
+            progress.report("optim", "Saving joined file", 0.53);
             std::string nextFile = (currentFile == tempFile1) ? tempFile2 : tempFile1;
             if (!loader.WriteGltfSceneToFile(&model, nextFile, false, false, true, false)) {
                 progress.error("optim", "Failed to write joined file");
@@ -1103,6 +1115,7 @@ int main(int argc, char** argv) {
         // Step 5: Weld vertices
         if (!optimSkipWeld) {
             progress.report("optim", "Step 5: Welding identical vertices", 0.60);
+            progress.report("optim", "Loading model for welding", 0.61);
             
             tinygltf::Model model;
             std::string err, warn;
@@ -1113,15 +1126,16 @@ int main(int argc, char** argv) {
             }
             
             gltfu::GltfWeld welder;
-            if (!welder.process(model, true)) {
-                progress.error("optim", "Weld failed: " + welder.getError());
+            gltfu::WeldOptions weldOpts;
+            weldOpts.overwrite = true;
+            
+            progress.report("optim", "Processing vertex welding", 0.63);
+            if (!welder.process(model, weldOpts)) {
+                progress.error("optim", "Weld operation failed");
                 return 1;
             }
             
-            if (optimVerbose && !welder.getStats().empty()) {
-                std::cout << "  " << welder.getStats() << std::endl;
-            }
-            
+            progress.report("optim", "Saving welded file", 0.68);
             std::string nextFile = (currentFile == tempFile1) ? tempFile2 : tempFile1;
             if (!loader.WriteGltfSceneToFile(&model, nextFile, false, false, true, false)) {
                 progress.error("optim", "Failed to write welded file");
@@ -1133,6 +1147,7 @@ int main(int argc, char** argv) {
         // Step 6: Simplify (optional)
         if (optimSimplify) {
             progress.report("optim", "Step 6: Simplifying meshes", 0.75);
+            progress.report("optim", "Loading model for simplification", 0.76);
             
             tinygltf::Model model;
             std::string err, warn;
@@ -1143,15 +1158,18 @@ int main(int argc, char** argv) {
             }
             
             gltfu::GltfSimplify simplifier;
-            if (!simplifier.process(model, optimSimplifyRatio, optimSimplifyError, optimLockBorder)) {
-                progress.error("optim", "Simplify failed: " + simplifier.getError());
+            gltfu::SimplifyOptions simplifyOpts;
+            simplifyOpts.ratio = optimSimplifyRatio;
+            simplifyOpts.error = optimSimplifyError;
+            simplifyOpts.lockBorder = optimLockBorder;
+            
+            progress.report("optim", "Processing mesh simplification", 0.78);
+            if (!simplifier.process(model, simplifyOpts)) {
+                progress.error("optim", "Simplify operation failed");
                 return 1;
             }
             
-            if (optimVerbose && !simplifier.getStats().empty()) {
-                std::cout << "  " << simplifier.getStats() << std::endl;
-            }
-            
+            progress.report("optim", "Saving simplified file", 0.83);
             std::string nextFile = (currentFile == tempFile1) ? tempFile2 : tempFile1;
             if (!loader.WriteGltfSceneToFile(&model, nextFile, false, false, true, false)) {
                 progress.error("optim", "Failed to write simplified file");
@@ -1163,6 +1181,7 @@ int main(int argc, char** argv) {
         // Step 7: Prune unused resources
         if (!optimSkipPrune) {
             progress.report("optim", "Step 7: Pruning unused resources", 0.85);
+            progress.report("optim", "Loading model for pruning", 0.86);
             
             tinygltf::Model model;
             std::string err, warn;
@@ -1173,15 +1192,17 @@ int main(int argc, char** argv) {
             }
             
             gltfu::GltfPrune pruner;
-            if (!pruner.process(model, false, false)) {
-                progress.error("optim", "Prune failed: " + pruner.getError());
+            gltfu::PruneOptions pruneOpts;
+            pruneOpts.keepLeaves = false;
+            pruneOpts.keepAttributes = false;
+            
+            progress.report("optim", "Processing resource pruning", 0.88);
+            if (!pruner.process(model, pruneOpts)) {
+                progress.error("optim", "Prune operation failed");
                 return 1;
             }
             
-            if (optimVerbose && !pruner.getStats().empty()) {
-                std::cout << "  " << pruner.getStats() << std::endl;
-            }
-            
+            progress.report("optim", "Saving pruned file", 0.93);
             std::string nextFile = (currentFile == tempFile1) ? tempFile2 : tempFile1;
             if (!loader.WriteGltfSceneToFile(&model, nextFile, false, false, true, false)) {
                 progress.error("optim", "Failed to write pruned file");
@@ -1192,6 +1213,7 @@ int main(int argc, char** argv) {
         
         // Final step: Write output with proper settings
         progress.report("optim", "Writing optimized output", 0.95);
+        progress.report("optim", "Loading final model", 0.96);
         
         tinygltf::Model finalModel;
         std::string err, warn;
@@ -1201,6 +1223,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         
+        progress.report("optim", "Writing final output file", 0.98);
         bool writeRet;
         if (optimWriteBinary) {
             for (auto& buffer : finalModel.buffers) {
