@@ -1,0 +1,8 @@
+{
+  "name": "gltfu",
+  "version": "1.0.0",
+  "description": "Memory-efficient GLTF operations CLI tool",
+  "dependencies": [
+    "cli11"
+  ]
+}
