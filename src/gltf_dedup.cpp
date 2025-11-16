@@ -70,18 +70,49 @@ std::string GltfDedup::createMaterialHash(const tinygltf::Material& material) co
     const auto& pbr = material.pbrMetallicRoughness;
     for (double v : pbr.baseColorFactor) ss << v << ";";
     ss << pbr.baseColorTexture.index << ";";
+    // Hash TextureInfo properties for baseColorTexture
+    ss << pbr.baseColorTexture.texCoord << ";";
+    ss << pbr.baseColorTexture.scale << ";";  // from KHR_texture_transform if present
+    // Note: TinyGLTF stores extensions in the TextureInfo itself
+    
     ss << pbr.metallicFactor << ";";
     ss << pbr.roughnessFactor << ";";
     ss << pbr.metallicRoughnessTexture.index << ";";
+    // Hash TextureInfo properties for metallicRoughnessTexture
+    ss << pbr.metallicRoughnessTexture.texCoord << ";";
+    ss << pbr.metallicRoughnessTexture.scale << ";";
     
-    // Hash other properties
+    // Hash normal texture with scale
     ss << material.normalTexture.index << ";";
+    ss << material.normalTexture.texCoord << ";";
+    ss << material.normalTexture.scale << ";";  // normalTexture has its own scale property
+    
+    // Hash occlusion texture with strength
     ss << material.occlusionTexture.index << ";";
+    ss << material.occlusionTexture.texCoord << ";";
+    ss << material.occlusionTexture.strength << ";";  // occlusionTexture has strength property
+    
+    // Hash emissive properties
     ss << material.emissiveTexture.index << ";";
+    ss << material.emissiveTexture.texCoord << ";";
+    ss << material.emissiveTexture.scale << ";";
     for (double v : material.emissiveFactor) ss << v << ";";
+    
+    // Hash alpha properties
     ss << material.alphaMode << ";";
     ss << material.alphaCutoff << ";";
     ss << material.doubleSided << ";";
+    
+    // Hash extensions (material extensions like KHR_materials_*)
+    // TinyGLTF stores these in material.extensions map
+    for (const auto& [extName, extValue] : material.extensions) {
+        ss << extName << ":" << extValue.Dump() << ";";
+    }
+    
+    // Hash extras if present
+    if (material.extras.Type() != tinygltf::NULL_TYPE) {
+        ss << "extras:" << material.extras.Dump() << ";";
+    }
     
     return ss.str();
 }
