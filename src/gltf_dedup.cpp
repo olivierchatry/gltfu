@@ -70,32 +70,52 @@ std::string GltfDedup::createMaterialHash(const tinygltf::Material& material) co
     const auto& pbr = material.pbrMetallicRoughness;
     for (double v : pbr.baseColorFactor) ss << v << ";";
     ss << pbr.baseColorTexture.index << ";";
-    // Hash TextureInfo properties for baseColorTexture
     ss << pbr.baseColorTexture.texCoord << ";";
-    ss << pbr.baseColorTexture.scale << ";";  // from KHR_texture_transform if present
-    // Note: TinyGLTF stores extensions in the TextureInfo itself
+    // Hash TextureInfo extensions (like KHR_texture_transform)
+    if (!pbr.baseColorTexture.extensions.empty()) {
+        for (const auto& [extName, extValue] : pbr.baseColorTexture.extensions) {
+            ss << "bcTexExt:" << extName << ";";
+        }
+    }
     
     ss << pbr.metallicFactor << ";";
     ss << pbr.roughnessFactor << ";";
     ss << pbr.metallicRoughnessTexture.index << ";";
-    // Hash TextureInfo properties for metallicRoughnessTexture
     ss << pbr.metallicRoughnessTexture.texCoord << ";";
-    ss << pbr.metallicRoughnessTexture.scale << ";";
+    if (!pbr.metallicRoughnessTexture.extensions.empty()) {
+        for (const auto& [extName, extValue] : pbr.metallicRoughnessTexture.extensions) {
+            ss << "mrTexExt:" << extName << ";";
+        }
+    }
     
-    // Hash normal texture with scale
+    // Hash normal texture (NormalTextureInfo has scale property)
     ss << material.normalTexture.index << ";";
     ss << material.normalTexture.texCoord << ";";
-    ss << material.normalTexture.scale << ";";  // normalTexture has its own scale property
+    ss << material.normalTexture.scale << ";";
+    if (!material.normalTexture.extensions.empty()) {
+        for (const auto& [extName, extValue] : material.normalTexture.extensions) {
+            ss << "nTexExt:" << extName << ";";
+        }
+    }
     
-    // Hash occlusion texture with strength
+    // Hash occlusion texture (OcclusionTextureInfo has strength property)
     ss << material.occlusionTexture.index << ";";
     ss << material.occlusionTexture.texCoord << ";";
-    ss << material.occlusionTexture.strength << ";";  // occlusionTexture has strength property
+    ss << material.occlusionTexture.strength << ";";
+    if (!material.occlusionTexture.extensions.empty()) {
+        for (const auto& [extName, extValue] : material.occlusionTexture.extensions) {
+            ss << "oTexExt:" << extName << ";";
+        }
+    }
     
     // Hash emissive properties
     ss << material.emissiveTexture.index << ";";
     ss << material.emissiveTexture.texCoord << ";";
-    ss << material.emissiveTexture.scale << ";";
+    if (!material.emissiveTexture.extensions.empty()) {
+        for (const auto& [extName, extValue] : material.emissiveTexture.extensions) {
+            ss << "eTexExt:" << extName << ";";
+        }
+    }
     for (double v : material.emissiveFactor) ss << v << ";";
     
     // Hash alpha properties
@@ -103,15 +123,16 @@ std::string GltfDedup::createMaterialHash(const tinygltf::Material& material) co
     ss << material.alphaCutoff << ";";
     ss << material.doubleSided << ";";
     
-    // Hash extensions (material extensions like KHR_materials_*)
-    // TinyGLTF stores these in material.extensions map
-    for (const auto& [extName, extValue] : material.extensions) {
-        ss << extName << ":" << extValue.Dump() << ";";
+    // Hash material extensions (like KHR_materials_*)
+    if (!material.extensions.empty()) {
+        for (const auto& [extName, extValue] : material.extensions) {
+            ss << "matExt:" << extName << ";";
+        }
     }
     
     // Hash extras if present
     if (material.extras.Type() != tinygltf::NULL_TYPE) {
-        ss << "extras:" << material.extras.Dump() << ";";
+        ss << "extras;";
     }
     
     return ss.str();
