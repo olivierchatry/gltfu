@@ -446,8 +446,6 @@ int GltfJoin::joinPrimitives(const std::vector<int>& primIndices,
 }
 
 bool GltfJoin::process(tinygltf::Model& model, const JoinOptions& options) {
-    std::cout << "Starting join operation..." << std::endl;
-    
     int primitivesJoined = 0;
     int meshesProcessed = 0;
     
@@ -463,7 +461,9 @@ bool GltfJoin::process(tinygltf::Model& model, const JoinOptions& options) {
             
             // Skip primitives with morph targets (not supported yet)
             if (!prim.targets.empty()) {
-                std::cout << "  Skipping primitive with morph targets" << std::endl;
+                if (options.verbose) {
+                    std::cout << "  Skipping primitive with morph targets" << std::endl;
+                }
                 continue;
             }
             
@@ -491,8 +491,10 @@ bool GltfJoin::process(tinygltf::Model& model, const JoinOptions& options) {
         std::unordered_set<int> primsToRemove;
         
         for (const auto& group : joinGroups) {
-            std::cout << "  Joining " << group.size() << " primitives in mesh '" 
-                     << mesh.name << "'" << std::endl;
+            if (options.verbose) {
+                std::cout << "  Joining " << group.size() << " primitives in mesh '" 
+                         << mesh.name << "'" << std::endl;
+            }
             
             int joinedIdx = joinPrimitives(group, mesh, model);
             
@@ -518,8 +520,10 @@ bool GltfJoin::process(tinygltf::Model& model, const JoinOptions& options) {
         }
     }
     
-    std::cout << "Join complete: processed " << meshesProcessed << " meshes, "
-             << "joined " << primitivesJoined << " primitives" << std::endl;
+    if (options.verbose) {
+        std::cout << "Join complete: processed " << meshesProcessed << " meshes, "
+                 << "joined " << primitivesJoined << " primitives" << std::endl;
+    }
     
     return true;
 }

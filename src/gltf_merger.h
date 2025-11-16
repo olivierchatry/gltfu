@@ -53,6 +53,12 @@ public:
     std::string getError() const { return errorMsg_; }
 
     /**
+     * @brief Get a copy of the merged model for further processing
+     * @return Copy of the merged model
+     */
+    tinygltf::Model getMergedModel() const;
+
+    /**
      * @brief Clear all loaded data
      */
     void clear();

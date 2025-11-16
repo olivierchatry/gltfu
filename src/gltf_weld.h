@@ -13,6 +13,9 @@ struct WeldOptions {
     // Whether to overwrite existing indices
     bool overwrite = true;
     
+    // Verbose output
+    bool verbose = false;
+    
     // Constructor with default values
     WeldOptions() = default;
 };
@@ -65,14 +68,9 @@ private:
         struct AttributeView {
             const uint8_t* data;
             size_t byteStride;
-            size_t paddedByteStride;
         };
         
         std::vector<AttributeView> attributes;
-        mutable std::vector<uint8_t> tempBuffer;
-        mutable std::vector<uint32_t> tempU32Buffer;
-        
-        size_t totalByteStride;
     };
 
     /**

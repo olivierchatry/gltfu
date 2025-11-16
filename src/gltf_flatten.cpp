@@ -321,6 +321,20 @@ void GltfFlatten::pruneEmptyNodes(tinygltf::Model& model) {
 
 int GltfFlatten::process(tinygltf::Model& model, bool cleanup) {
     int flattenedCount = 0;
+    size_t totalNodes = model.nodes.size();
+    
+    if (totalNodes == 0) return 0;
+    
+    // Build parent map once (O(n) instead of O(n²))
+    std::vector<int> parentMap(totalNodes, -1);
+    for (size_t i = 0; i < totalNodes; ++i) {
+        const auto& node = model.nodes[i];
+        for (int childIdx : node.children) {
+            if (childIdx >= 0 && childIdx < static_cast<int>(totalNodes)) {
+                parentMap[childIdx] = static_cast<int>(i);
+            }
+        }
+    }
     
     // (1) Mark joints from skins
     std::set<int> joints;
@@ -342,80 +356,97 @@ int GltfFlatten::process(tinygltf::Model& model, bool cleanup) {
         }
     }
     
-    // (3) Mark descendants of joints/animated nodes
-    std::set<int> hasJointParent;
-    std::set<int> hasAnimatedParent;
+    // (3) Mark descendants of joints/animated nodes in single pass
+    std::vector<bool> hasConstrainedAncestor(totalNodes, false);
     
-    for (const auto& scene : model.scenes) {
-        for (int rootNodeIdx : scene.nodes) {
-            std::function<void(int)> traverse = [&](int nodeIdx) {
-                if (nodeIdx < 0 || nodeIdx >= static_cast<int>(model.nodes.size())) return;
-                
-                const auto& node = model.nodes[nodeIdx];
-                int parent = getParentNode(model, nodeIdx);
-                
-                if (parent >= 0) {
-                    if (joints.find(parent) != joints.end() || hasJointParent.find(parent) != hasJointParent.end()) {
-                        hasJointParent.insert(nodeIdx);
-                    }
-                    if (animated.find(parent) != animated.end() || hasAnimatedParent.find(parent) != hasAnimatedParent.end()) {
-                        hasAnimatedParent.insert(nodeIdx);
-                    }
-                }
-                
-                for (int childIdx : node.children) {
-                    traverse(childIdx);
-                }
-            };
-            
-            traverse(rootNodeIdx);
+    for (size_t i = 0; i < totalNodes; ++i) {
+        int current = static_cast<int>(i);
+        bool constrained = false;
+        
+        // Walk up to find constrained ancestor
+        while (current >= 0 && !constrained) {
+            if (joints.count(current) || animated.count(current)) {
+                constrained = true;
+            }
+            current = parentMap[current];
+        }
+        
+        if (constrained) {
+            hasConstrainedAncestor[i] = true;
         }
     }
     
-    // (4) For each affected node, clear parents
-    // We need to collect nodes to flatten first, then flatten them
+    // (4) Collect nodes to flatten (nodes with parents that aren't constrained)
     std::vector<int> nodesToFlatten;
+    nodesToFlatten.reserve(totalNodes / 2); // Estimate
     
-    for (const auto& scene : model.scenes) {
-        for (int rootNodeIdx : scene.nodes) {
-            std::function<void(int)> collectNodes = [&](int nodeIdx) {
-                if (nodeIdx < 0 || nodeIdx >= static_cast<int>(model.nodes.size())) return;
-                
-                // Skip if constrained
-                if (animated.find(nodeIdx) != animated.end()) return;
-                if (hasJointParent.find(nodeIdx) != hasJointParent.end()) return;
-                if (hasAnimatedParent.find(nodeIdx) != hasAnimatedParent.end()) return;
-                
-                // Check if has parent
-                if (getParentNode(model, nodeIdx) >= 0) {
-                    nodesToFlatten.push_back(nodeIdx);
-                }
-                
-                const auto& node = model.nodes[nodeIdx];
-                for (int childIdx : node.children) {
-                    collectNodes(childIdx);
-                }
-            };
-            
-            collectNodes(rootNodeIdx);
+    for (size_t i = 0; i < totalNodes; ++i) {
+        // Skip if constrained
+        if (animated.count(i) || joints.count(i) || hasConstrainedAncestor[i]) {
+            continue;
+        }
+        
+        // Only flatten if has parent
+        if (parentMap[i] >= 0) {
+            nodesToFlatten.push_back(static_cast<int>(i));
         }
     }
     
-    // Flatten collected nodes
+    // (5) Flatten collected nodes
     for (int nodeIdx : nodesToFlatten) {
-        clearNodeParent(model, nodeIdx);
+        // Find which scenes contain this node's root
+        int rootNode = nodeIdx;
+        while (parentMap[rootNode] >= 0) {
+            rootNode = parentMap[rootNode];
+        }
+        
+        std::vector<int> sceneIndices;
+        for (size_t sceneIdx = 0; sceneIdx < model.scenes.size(); ++sceneIdx) {
+            const auto& scene = model.scenes[sceneIdx];
+            if (std::find(scene.nodes.begin(), scene.nodes.end(), rootNode) != scene.nodes.end()) {
+                sceneIndices.push_back(static_cast<int>(sceneIdx));
+            }
+        }
+        
+        int parentIdx = parentMap[nodeIdx];
+        if (parentIdx < 0) continue; // Already at root
+        
+        // Compute world matrix by walking up parent chain
+        std::vector<double> worldMatrix = identityMatrix();
+        int current = nodeIdx;
+        std::vector<int> ancestors;
+        while (current >= 0) {
+            ancestors.push_back(current);
+            current = parentMap[current];
+        }
+        
+        for (auto it = ancestors.rbegin(); it != ancestors.rend(); ++it) {
+            std::vector<double> localMatrix = getNodeMatrix(model.nodes[*it]);
+            worldMatrix = multiplyMatrices(worldMatrix, localMatrix);
+        }
+        
+        // Apply world transform to node
+        setNodeMatrix(model.nodes[nodeIdx], worldMatrix);
+        
+        // Remove from parent
+        auto& parent = model.nodes[parentIdx];
+        parent.children.erase(
+            std::remove(parent.children.begin(), parent.children.end(), nodeIdx),
+            parent.children.end()
+        );
+        
+        // Add to scene roots
+        for (int sceneIdx : sceneIndices) {
+            auto& scene = model.scenes[sceneIdx];
+            if (std::find(scene.nodes.begin(), scene.nodes.end(), nodeIdx) == scene.nodes.end()) {
+                scene.nodes.push_back(nodeIdx);
+            }
+        }
+        
+        // Update parent map
+        parentMap[nodeIdx] = -1;
+        
         flattenedCount++;
-    }
-    
-    // (5) Optional cleanup
-    if (cleanup) {
-        // Note: Full pruning is complex due to index remapping
-        // For now we skip it, but a full implementation would call pruneEmptyNodes
-        // pruneEmptyNodes(model);
-    }
-    
-    if (animated.size() > 0) {
-        std::cout << "Warning: " << animated.size() << " animated nodes were not flattened" << std::endl;
     }
     
     return flattenedCount;

@@ -438,6 +438,10 @@ bool GltfMerger::save(const std::string& filename,
     return true;
 }
 
+tinygltf::Model GltfMerger::getMergedModel() const {
+    return impl_->mergedModel;
+}
+
 void GltfMerger::clear() {
     impl_->mergedModel = tinygltf::Model();
     impl_->firstModel = true;

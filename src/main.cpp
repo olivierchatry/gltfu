@@ -7,6 +7,7 @@
 #include "gltf_prune.h"
 #include "gltf_simplify.h"
 #include "gltf_info.h"
+#include "gltf_compress.h"
 #include "progress_reporter.h"
 
 #include <iostream>
@@ -263,14 +264,6 @@ int main(int argc, char** argv) {
         
         progress.success("dedupe", "Successfully deduplicated to: " + dedupeOutput);
         return 0;
-    });
-    
-    // Future subcommands (placeholders)
-    
-    auto* compressCmd = app.add_subcommand("compress", "Compress GLTF data [NOT YET IMPLEMENTED]");
-    compressCmd->callback([]() {
-        std::cerr << "Compression not yet implemented" << std::endl;
-        return 1;
     });
     
     // Info subcommand
@@ -905,6 +898,11 @@ int main(int argc, char** argv) {
     float optimSimplifyRatio = 0.75f;
     float optimSimplifyError = 0.01f;
     bool optimLockBorder = false;
+    bool optimCompress = false;
+    int optimCompressPositionBits = 14;
+    int optimCompressNormalBits = 10;
+    int optimCompressTexcoordBits = 12;
+    int optimCompressColorBits = 8;
     bool optimSkipDedupe = false;
     bool optimSkipFlatten = false;
     bool optimSkipJoin = false;
@@ -936,6 +934,27 @@ int main(int argc, char** argv) {
     
     optimCmd->add_flag("--simplify-lock-border", optimLockBorder, 
                       "Lock border vertices during simplification");
+    
+#ifdef GLTFU_ENABLE_DRACO
+    optimCmd->add_flag("--compress", optimCompress, 
+                      "Apply Draco mesh compression");
+    
+    optimCmd->add_option("--compress-position-bits", optimCompressPositionBits, 
+                        "Quantization bits for positions (default: 14)")
+        ->check(CLI::Range(10, 16));
+    
+    optimCmd->add_option("--compress-normal-bits", optimCompressNormalBits, 
+                        "Quantization bits for normals (default: 10)")
+        ->check(CLI::Range(8, 12));
+    
+    optimCmd->add_option("--compress-texcoord-bits", optimCompressTexcoordBits, 
+                        "Quantization bits for texture coordinates (default: 12)")
+        ->check(CLI::Range(10, 14));
+    
+    optimCmd->add_option("--compress-color-bits", optimCompressColorBits, 
+                        "Quantization bits for colors (default: 8)")
+        ->check(CLI::Range(6, 10));
+#endif
     
     optimCmd->add_flag("--skip-dedupe", optimSkipDedupe, 
                       "Skip deduplication pass");
@@ -980,12 +999,10 @@ int main(int argc, char** argv) {
         
         progress.report("optim", "Starting optimization pipeline", 0.0);
         
-        std::string currentFile;
-        std::string tempFile1 = optimOutput + ".temp1.gltf";
-        std::string tempFile2 = optimOutput + ".temp2.gltf";
         tinygltf::TinyGLTF loader;
+        tinygltf::Model model;
         
-        // Step 1: Merge input files if multiple
+        // Step 1: Load and merge input files
         if (optimInputs.size() > 1) {
             progress.report("optim", "Step 1: Merging " + std::to_string(optimInputs.size()) + " files", 0.05);
             
@@ -999,28 +1016,21 @@ int main(int argc, char** argv) {
                 }
             }
             
-            progress.report("optim", "Saving merged file", 0.10);
-            if (!merger.save(tempFile1, false, false, true, false)) {
-                progress.error("optim", "Failed to save merged file");
+            progress.report("optim", "Extracting merged model", 0.10);
+            model = merger.getMergedModel();
+        } else {
+            progress.report("optim", "Loading input file", 0.05);
+            std::string err, warn;
+            bool ret = loader.LoadASCIIFromFile(&model, &err, &warn, optimInputs[0]);
+            if (!ret) {
+                progress.error("optim", "Failed to load file: " + err);
                 return 1;
             }
-            currentFile = tempFile1;
-        } else {
-            currentFile = optimInputs[0];
         }
         
-        // Step 2: Deduplicate
+        // Step 2: Deduplicate (in-place)
         if (!optimSkipDedupe) {
             progress.report("optim", "Step 2: Deduplicating resources", 0.15);
-            progress.report("optim", "Loading model for deduplication", 0.16);
-            
-            tinygltf::Model model;
-            std::string err, warn;
-            bool ret = loader.LoadASCIIFromFile(&model, &err, &warn, currentFile);
-            if (!ret) {
-                progress.error("optim", "Failed to load file for dedupe: " + err);
-                return 1;
-            }
             
             gltfu::GltfDedup deduper;
             gltfu::GltfDedup::Options dedupOpts;
@@ -1032,7 +1042,6 @@ int main(int argc, char** argv) {
             dedupOpts.verbose = optimVerbose;
             dedupOpts.progressReporter = &progress;
             
-            progress.report("optim", "Processing deduplication", 0.18);
             if (!deduper.process(model, dedupOpts)) {
                 progress.error("optim", "Deduplication failed: " + deduper.getError());
                 return 1;
@@ -1041,121 +1050,53 @@ int main(int argc, char** argv) {
             if (optimVerbose && !deduper.getStats().empty()) {
                 std::cout << "  " << deduper.getStats() << std::endl;
             }
-            
-            progress.report("optim", "Saving deduplicated file", 0.25);
-            if (!loader.WriteGltfSceneToFile(&model, tempFile2, false, false, true, false)) {
-                progress.error("optim", "Failed to write deduplicated file");
-                return 1;
-            }
-            currentFile = tempFile2;
         }
         
-        // Step 3: Flatten scene graph
+        // Step 3: Flatten scene graph (in-place)
         if (!optimSkipFlatten) {
             progress.report("optim", "Step 3: Flattening scene graph", 0.30);
-            progress.report("optim", "Loading model for flattening", 0.31);
             
-            tinygltf::Model model;
-            std::string err, warn;
-            bool ret = loader.LoadASCIIFromFile(&model, &err, &warn, currentFile);
-            if (!ret) {
-                progress.error("optim", "Failed to load file for flatten: " + err);
-                return 1;
-            }
-            
-            progress.report("optim", "Processing scene graph flattening", 0.33);
             int flattenedCount = gltfu::GltfFlatten::process(model, true);
             
             if (optimVerbose) {
                 std::cout << "  Flattened " << flattenedCount << " nodes" << std::endl;
             }
-            
-            progress.report("optim", "Saving flattened file", 0.38);
-            std::string nextFile = (currentFile == tempFile1) ? tempFile2 : tempFile1;
-            if (!loader.WriteGltfSceneToFile(&model, nextFile, false, false, true, false)) {
-                progress.error("optim", "Failed to write flattened file");
-                return 1;
-            }
-            currentFile = nextFile;
         }
         
-        // Step 4: Join primitives
+        // Step 4: Join primitives (in-place)
         if (!optimSkipJoin) {
             progress.report("optim", "Step 4: Joining compatible primitives", 0.45);
-            progress.report("optim", "Loading model for joining", 0.46);
-            
-            tinygltf::Model model;
-            std::string err, warn;
-            bool ret = loader.LoadASCIIFromFile(&model, &err, &warn, currentFile);
-            if (!ret) {
-                progress.error("optim", "Failed to load file for join: " + err);
-                return 1;
-            }
             
             gltfu::GltfJoin joiner;
             gltfu::JoinOptions joinOpts;
             joinOpts.keepMeshes = false;
             joinOpts.keepNamed = false;
+            joinOpts.verbose = optimVerbose;
             
-            progress.report("optim", "Processing primitive joining", 0.48);
             if (!joiner.process(model, joinOpts)) {
                 progress.error("optim", "Join operation failed");
                 return 1;
             }
-            
-            progress.report("optim", "Saving joined file", 0.53);
-            std::string nextFile = (currentFile == tempFile1) ? tempFile2 : tempFile1;
-            if (!loader.WriteGltfSceneToFile(&model, nextFile, false, false, true, false)) {
-                progress.error("optim", "Failed to write joined file");
-                return 1;
-            }
-            currentFile = nextFile;
         }
         
-        // Step 5: Weld vertices
+        // Step 5: Weld vertices (in-place)
         if (!optimSkipWeld) {
             progress.report("optim", "Step 5: Welding identical vertices", 0.60);
-            progress.report("optim", "Loading model for welding", 0.61);
-            
-            tinygltf::Model model;
-            std::string err, warn;
-            bool ret = loader.LoadASCIIFromFile(&model, &err, &warn, currentFile);
-            if (!ret) {
-                progress.error("optim", "Failed to load file for weld: " + err);
-                return 1;
-            }
             
             gltfu::GltfWeld welder;
             gltfu::WeldOptions weldOpts;
             weldOpts.overwrite = true;
+            weldOpts.verbose = optimVerbose;
             
-            progress.report("optim", "Processing vertex welding", 0.63);
             if (!welder.process(model, weldOpts)) {
                 progress.error("optim", "Weld operation failed");
                 return 1;
             }
-            
-            progress.report("optim", "Saving welded file", 0.68);
-            std::string nextFile = (currentFile == tempFile1) ? tempFile2 : tempFile1;
-            if (!loader.WriteGltfSceneToFile(&model, nextFile, false, false, true, false)) {
-                progress.error("optim", "Failed to write welded file");
-                return 1;
-            }
-            currentFile = nextFile;
         }
         
-        // Step 6: Simplify (optional)
+        // Step 6: Simplify (in-place, optional)
         if (optimSimplify) {
             progress.report("optim", "Step 6: Simplifying meshes", 0.75);
-            progress.report("optim", "Loading model for simplification", 0.76);
-            
-            tinygltf::Model model;
-            std::string err, warn;
-            bool ret = loader.LoadASCIIFromFile(&model, &err, &warn, currentFile);
-            if (!ret) {
-                progress.error("optim", "Failed to load file for simplify: " + err);
-                return 1;
-            }
             
             gltfu::GltfSimplify simplifier;
             gltfu::SimplifyOptions simplifyOpts;
@@ -1163,76 +1104,63 @@ int main(int argc, char** argv) {
             simplifyOpts.error = optimSimplifyError;
             simplifyOpts.lockBorder = optimLockBorder;
             
-            progress.report("optim", "Processing mesh simplification", 0.78);
             if (!simplifier.process(model, simplifyOpts)) {
                 progress.error("optim", "Simplify operation failed");
                 return 1;
             }
-            
-            progress.report("optim", "Saving simplified file", 0.83);
-            std::string nextFile = (currentFile == tempFile1) ? tempFile2 : tempFile1;
-            if (!loader.WriteGltfSceneToFile(&model, nextFile, false, false, true, false)) {
-                progress.error("optim", "Failed to write simplified file");
-                return 1;
-            }
-            currentFile = nextFile;
         }
         
-        // Step 7: Prune unused resources
-        if (!optimSkipPrune) {
-            progress.report("optim", "Step 7: Pruning unused resources", 0.85);
-            progress.report("optim", "Loading model for pruning", 0.86);
+#ifdef GLTFU_ENABLE_DRACO
+        // Step 6.5: Compress meshes with Draco (in-place)
+        if (optimCompress) {
+            progress.report("optim", "Step 6.5: Compressing meshes with Draco", 0.84);
             
-            tinygltf::Model model;
-            std::string err, warn;
-            bool ret = loader.LoadASCIIFromFile(&model, &err, &warn, currentFile);
-            if (!ret) {
-                progress.error("optim", "Failed to load file for prune: " + err);
+            gltfu::GltfCompress compressor;
+            gltfu::CompressOptions compressOpts;
+            compressOpts.positionQuantizationBits = optimCompressPositionBits;
+            compressOpts.normalQuantizationBits = optimCompressNormalBits;
+            compressOpts.texCoordQuantizationBits = optimCompressTexcoordBits;
+            compressOpts.colorQuantizationBits = optimCompressColorBits;
+            compressOpts.verbose = optimVerbose;
+            
+            if (!compressor.process(model, compressOpts)) {
+                progress.error("optim", "Compression operation failed: " + compressor.getError());
                 return 1;
             }
+            
+            if (optimVerbose) {
+                std::cout << compressor.getStats() << std::endl;
+            }
+        }
+#endif
+        
+        // Step 7: Prune unused resources (in-place)
+        if (!optimSkipPrune) {
+            progress.report("optim", "Step 7: Pruning unused resources", 0.87);
             
             gltfu::GltfPrune pruner;
             gltfu::PruneOptions pruneOpts;
             pruneOpts.keepLeaves = false;
             pruneOpts.keepAttributes = false;
             
-            progress.report("optim", "Processing resource pruning", 0.88);
             if (!pruner.process(model, pruneOpts)) {
                 progress.error("optim", "Prune operation failed");
                 return 1;
             }
-            
-            progress.report("optim", "Saving pruned file", 0.93);
-            std::string nextFile = (currentFile == tempFile1) ? tempFile2 : tempFile1;
-            if (!loader.WriteGltfSceneToFile(&model, nextFile, false, false, true, false)) {
-                progress.error("optim", "Failed to write pruned file");
-                return 1;
-            }
-            currentFile = nextFile;
         }
         
         // Final step: Write output with proper settings
         progress.report("optim", "Writing optimized output", 0.95);
-        progress.report("optim", "Loading final model", 0.96);
         
-        tinygltf::Model finalModel;
-        std::string err, warn;
-        bool ret = loader.LoadASCIIFromFile(&finalModel, &err, &warn, currentFile);
-        if (!ret) {
-            progress.error("optim", "Failed to load final file: " + err);
-            return 1;
-        }
-        
-        progress.report("optim", "Writing final output file", 0.98);
         bool writeRet;
         if (optimWriteBinary) {
-            for (auto& buffer : finalModel.buffers) {
+            for (auto& buffer : model.buffers) {
                 buffer.uri.clear();
             }
-            writeRet = loader.WriteGltfSceneToFile(&finalModel, optimOutput, 
+            writeRet = loader.WriteGltfSceneToFile(&model, optimOutput, 
                                                   optimEmbedImages, true, optimPrettyPrint, true);
         } else {
-            writeRet = loader.WriteGltfSceneToFile(&finalModel, optimOutput, 
+            writeRet = loader.WriteGltfSceneToFile(&model, optimOutput, 
                                                   optimEmbedImages, optimEmbedBuffers, optimPrettyPrint, false);
         }
         
@@ -1240,10 +1168,6 @@ int main(int argc, char** argv) {
             progress.error("optim", "Failed to write final output");
             return 1;
         }
-        
-        // Clean up temp files
-        std::remove(tempFile1.c_str());
-        std::remove(tempFile2.c_str());
         
         progress.success("optim", "Optimization complete: " + optimOutput);
         return 0;

@@ -8,11 +8,6 @@ namespace gltfu {
 
 namespace {
     const uint32_t EMPTY_U32 = 0xFFFFFFFF;
-
-    // Pad number to next multiple of 4
-    size_t padNumber(size_t n) {
-        return (n + 3) & ~3;
-    }
 }
 
 GltfWeld::GltfWeld() = default;
@@ -112,9 +107,7 @@ uint32_t GltfWeld::hashLookup(const std::vector<uint32_t>& table,
 }
 
 // VertexStream implementation
-GltfWeld::VertexStream::VertexStream(const tinygltf::Primitive& prim, const tinygltf::Model& model) 
-    : totalByteStride(0) {
-    
+GltfWeld::VertexStream::VertexStream(const tinygltf::Primitive& prim, const tinygltf::Model& model) {
     // Collect all attributes
     for (const auto& attrPair : prim.attributes) {
         int accessorIdx = attrPair.second;
@@ -155,47 +148,74 @@ GltfWeld::VertexStream::VertexStream(const tinygltf::Primitive& prim, const tiny
         }
         
         view.byteStride = elementSize * componentSize;
-        view.paddedByteStride = padNumber(view.byteStride);
         
         attributes.push_back(view);
-        totalByteStride += view.paddedByteStride;
     }
-    
-    // Allocate temporary buffers
-    tempBuffer.resize(totalByteStride);
-    tempU32Buffer.resize((totalByteStride + 3) / 4);
 }
 
 uint32_t GltfWeld::VertexStream::hash(uint32_t index) const {
-    // Load vertex into 4-byte-aligned view
-    size_t byteOffset = 0;
+    // Compute hash directly from attribute data without copying
+    uint32_t h = 0;
+    const uint32_t m = 0x5bd1e995;
+    const uint32_t r = 24;
+    
     for (const auto& attr : attributes) {
         const uint8_t* src = attr.data + index * attr.byteStride;
+        const uint32_t* src32 = reinterpret_cast<const uint32_t*>(src);
+        size_t numFullWords = attr.byteStride / 4;
         
-        for (size_t i = 0; i < attr.paddedByteStride; ++i) {
-            if (i < attr.byteStride) {
-                tempBuffer[byteOffset + i] = src[i];
-            } else {
-                tempBuffer[byteOffset + i] = 0;
-            }
+        // Hash full 32-bit words
+        for (size_t i = 0; i < numFullWords; ++i) {
+            uint32_t k = src32[i];
+            k = (k * m) & 0xFFFFFFFF;
+            k = (k ^ (k >> r)) & 0xFFFFFFFF;
+            k = (k * m) & 0xFFFFFFFF;
+            h = (h * m) & 0xFFFFFFFF;
+            h = (h ^ k) & 0xFFFFFFFF;
         }
-        byteOffset += attr.paddedByteStride;
+        
+        // Handle remaining bytes
+        size_t remainingBytes = attr.byteStride % 4;
+        if (remainingBytes > 0) {
+            uint32_t k = 0;
+            size_t offset = numFullWords * 4;
+            for (size_t i = 0; i < remainingBytes; ++i) {
+                k |= static_cast<uint32_t>(src[offset + i]) << (i * 8);
+            }
+            k = (k * m) & 0xFFFFFFFF;
+            k = (k ^ (k >> r)) & 0xFFFFFFFF;
+            k = (k * m) & 0xFFFFFFFF;
+            h = (h * m) & 0xFFFFFFFF;
+            h = (h ^ k) & 0xFFFFFFFF;
+        }
     }
     
-    // Copy to u32 view
-    std::memcpy(tempU32Buffer.data(), tempBuffer.data(), totalByteStride);
-    
-    // Compute hash
-    return murmurHash2(0, tempU32Buffer.data(), tempU32Buffer.size());
+    return h;
 }
 
 bool GltfWeld::VertexStream::equal(uint32_t a, uint32_t b) const {
+    if (a == b) return true;
+    
     for (const auto& attr : attributes) {
         const uint8_t* dataA = attr.data + a * attr.byteStride;
         const uint8_t* dataB = attr.data + b * attr.byteStride;
         
-        if (std::memcmp(dataA, dataB, attr.byteStride) != 0) {
-            return false;
+        // Fast comparison using 64-bit words when possible
+        size_t numWords = attr.byteStride / 8;
+        const uint64_t* ptrA64 = reinterpret_cast<const uint64_t*>(dataA);
+        const uint64_t* ptrB64 = reinterpret_cast<const uint64_t*>(dataB);
+        
+        for (size_t i = 0; i < numWords; ++i) {
+            if (ptrA64[i] != ptrB64[i]) return false;
+        }
+        
+        // Compare remaining bytes
+        size_t remaining = attr.byteStride % 8;
+        if (remaining > 0) {
+            size_t offset = numWords * 8;
+            if (std::memcmp(dataA + offset, dataB + offset, remaining) != 0) {
+                return false;
+            }
         }
     }
     return true;
@@ -462,11 +482,24 @@ bool GltfWeld::weldPrimitive(tinygltf::Primitive& primitive,
         }
     }
     
-    // Compare and identify indices to weld
+    // Compare and identify indices to weld - process unique vertices only
+    std::vector<uint32_t> uniqueVertices;
+    uniqueVertices.reserve(srcVertexCount);
+    
     for (uint32_t i = 0; i < srcIndicesCount; ++i) {
         uint32_t srcIndex = srcIndicesArray[i];
-        if (writeMap[srcIndex] != EMPTY_U32) continue;
-        
+        if (writeMap[srcIndex] == EMPTY_U32) {
+            uniqueVertices.push_back(srcIndex);
+            writeMap[srcIndex] = 0; // Mark as seen
+        }
+    }
+    
+    // Reset writeMap and process unique vertices only
+    for (uint32_t srcIndex : uniqueVertices) {
+        writeMap[srcIndex] = EMPTY_U32;
+    }
+    
+    for (uint32_t srcIndex : uniqueVertices) {
         uint32_t hashIndex = hashLookup(table, tableSize, stream, srcIndex, EMPTY_U32);
         uint32_t dstIndex = table[hashIndex];
         
@@ -478,16 +511,16 @@ bool GltfWeld::weldPrimitive(tinygltf::Primitive& primitive,
         }
     }
     
-    std::cout << "  Welded: " << srcVertexCount << " → " << dstVertexCount 
-             << " vertices (" << (srcVertexCount - dstVertexCount) << " removed)" << std::endl;
+    if (options.verbose) {
+        std::cout << "  Welded: " << srcVertexCount << " → " << dstVertexCount 
+                 << " vertices (" << (srcVertexCount - dstVertexCount) << " removed)" << std::endl;
+    }
     
     // Compact primitive
     return compactPrimitive(primitive, mesh, model, writeMap, dstVertexCount);
 }
 
 bool GltfWeld::process(tinygltf::Model& model, const WeldOptions& options) {
-    std::cout << "Starting weld operation..." << std::endl;
-    
     int primitivesWelded = 0;
     int meshesProcessed = 0;
     
@@ -506,8 +539,10 @@ bool GltfWeld::process(tinygltf::Model& model, const WeldOptions& options) {
         }
     }
     
-    std::cout << "Weld complete: processed " << meshesProcessed << " meshes, "
-             << "welded " << primitivesWelded << " primitives" << std::endl;
+    if (options.verbose) {
+        std::cout << "Weld complete: processed " << meshesProcessed << " meshes, "
+                 << "welded " << primitivesWelded << " primitives" << std::endl;
+    }
     
     return true;
 }

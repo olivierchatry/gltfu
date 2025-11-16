@@ -16,6 +16,9 @@ struct JoinOptions {
     // Keep named meshes and nodes separate
     bool keepNamed = false;
     
+    // Verbose output
+    bool verbose = false;
+    
     // Constructor with default values
     JoinOptions() = default;
 };
