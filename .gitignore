@@ -16,3 +16,4 @@ gltfu
 compile_commands.json
 vcpkg_installed/
 third_party/*
+.venv

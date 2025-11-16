@@ -53,7 +53,45 @@ bool GltfPrune::process(tinygltf::Model& model, const PruneOptions& options) {
     // Prune unused vertex attributes if requested
     if (!options.keepAttributes) {
         pruneUnusedAttributes(model);
+
+        usedNodes.clear();
+        usedMeshes.clear();
+        usedMaterials.clear();
+        usedAccessors.clear();
+        usedTextures.clear();
+        usedImages.clear();
+        usedSamplers.clear();
+        usedBufferViews.clear();
+        usedBuffers.clear();
+        usedSkins.clear();
+        usedCameras.clear();
+
+        markReachableFromScenes(model, usedNodes, usedMeshes, usedMaterials,
+                               usedAccessors, usedTextures, usedImages, usedSamplers,
+                               usedBufferViews, usedBuffers, usedSkins, usedCameras);
+        markAnimationResources(model, usedNodes, usedAccessors, usedBufferViews, usedBuffers);
     }
+
+    auto ensureAccessorResourcesMarked = [&]() {
+        for (int accessorIdx : usedAccessors) {
+            if (accessorIdx < 0 || accessorIdx >= static_cast<int>(model.accessors.size())) {
+                continue;
+            }
+            const auto& accessor = model.accessors[accessorIdx];
+            if (accessor.bufferView < 0 || accessor.bufferView >= static_cast<int>(model.bufferViews.size())) {
+                continue;
+            }
+
+            usedBufferViews.insert(accessor.bufferView);
+
+            const auto& bufferView = model.bufferViews[accessor.bufferView];
+            if (bufferView.buffer >= 0 && bufferView.buffer < static_cast<int>(model.buffers.size())) {
+                usedBuffers.insert(bufferView.buffer);
+            }
+        }
+    };
+
+    ensureAccessorResourcesMarked();
     
     // Build index maps for remapping
     auto nodeMap = buildIndexMap(model.nodes.size(), usedNodes);

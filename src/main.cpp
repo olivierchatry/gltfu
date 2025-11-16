@@ -177,9 +177,10 @@ int main(int argc, char** argv) {
                         "Write binary GLTF (.glb) format (auto-detected from .glb extension)");
     
     dedupeCmd->callback([&]() {
-        gltfu::ProgressReporter progress(
-            jsonProgress ? gltfu::ProgressReporter::Format::JSON : gltfu::ProgressReporter::Format::Text
-        );
+        const auto progressFormat = jsonProgress
+            ? gltfu::ProgressReporter::Format::JSON
+            : (verbose ? gltfu::ProgressReporter::Format::Text : gltfu::ProgressReporter::Format::Silent);
+        gltfu::ProgressReporter progress(progressFormat);
         
         // Auto-detect binary format from output file extension
         if (!dedupeWriteBinary && isGlbFile(dedupeOutput)) {
@@ -235,7 +236,11 @@ int main(int argc, char** argv) {
         // Print stats
         std::string stats = deduper.getStats();
         if (!stats.empty()) {
-            progress.report("dedupe", "Deduplication complete", 0.9, stats);
+            if (jsonProgress || verbose) {
+                progress.report("dedupe", "Deduplication complete", 0.9, stats);
+            } else {
+                std::cout << stats;
+            }
         }
         
         // When writing to GLB, clear buffer URIs so data is embedded in binary chunk
@@ -1022,7 +1027,15 @@ int main(int argc, char** argv) {
         } else {
             progress.report("optim", "Loading input file", 0.05);
             std::string err, warn;
-            bool ret = loader.LoadASCIIFromFile(&model, &err, &warn, optimInputs[0]);
+            bool ret = false;
+            if (isGlbFile(optimInputs[0])) {
+                ret = loader.LoadBinaryFromFile(&model, &err, &warn, optimInputs[0]);
+            } else {
+                ret = loader.LoadASCIIFromFile(&model, &err, &warn, optimInputs[0]);
+            }
+            if (!warn.empty() && !jsonProgress) {
+                std::cerr << "Warning: " << warn << std::endl;
+            }
             if (!ret) {
                 progress.error("optim", "Failed to load file: " + err);
                 return 1;

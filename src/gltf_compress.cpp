@@ -2,6 +2,9 @@
 #include <iostream>
 #include <sstream>
 #include <iomanip>
+#include <cstring>
+#include <cfloat>
+#include <algorithm>
 
 #ifdef GLTFU_ENABLE_DRACO
 #include "draco/compression/encode.h"
@@ -25,7 +28,7 @@ bool GltfCompress::process(tinygltf::Model& model, const CompressOptions& option
     
     size_t totalOriginalSize = 0;
     size_t totalCompressedSize = 0;
-    int compressedPrimitives = 0;
+    int skippedPrimitives = 0;
     
     // Add KHR_draco_mesh_compression to extensionsUsed if not already present
     bool hasExtension = false;
@@ -50,6 +53,19 @@ bool GltfCompress::process(tinygltf::Model& model, const CompressOptions& option
     if (!hasExtension) {
         model.extensionsRequired.push_back("KHR_draco_mesh_compression");
     }
+    
+    // Create a single consolidated buffer for all compressed data
+    tinygltf::Buffer compressedBuffer;
+    std::vector<uint8_t> bufferData;
+    
+    // Track primitives and their compressed data offsets
+    struct PrimitiveCompressData {
+        size_t meshIdx;
+        size_t primIdx;
+        size_t byteOffset;
+        size_t byteLength;
+    };
+    std::vector<PrimitiveCompressData> compressedPrimitives;
     
     // Process each mesh
     for (size_t meshIdx = 0; meshIdx < model.meshes.size(); ++meshIdx) {
@@ -82,40 +98,114 @@ bool GltfCompress::process(tinygltf::Model& model, const CompressOptions& option
             totalOriginalSize += originalSize;
             
             // Compress the primitive
-            if (!compressPrimitive(model, mesh, primIdx, options)) {
-                // Continue with next primitive on error
+            std::vector<uint8_t> compressedData;
+            if (!compressPrimitive(model, mesh, primIdx, options, compressedData)) {
+                skippedPrimitives++;
                 continue;
             }
             
-            // Calculate compressed size
+            // Record offset and append to consolidated buffer
+            size_t byteOffset = bufferData.size();
+            bufferData.insert(bufferData.end(), compressedData.begin(), compressedData.end());
+            
+            compressedPrimitives.push_back({meshIdx, primIdx, byteOffset, compressedData.size()});
+            totalCompressedSize += compressedData.size();
+            
+            if (options.verbose) {
+                double ratio = originalSize > 0 ? (double)compressedData.size() / originalSize * 100.0 : 0.0;
+                std::cout << "  Compressed primitive " << compressedPrimitives.size() - 1
+                          << ": " << originalSize << " → " << compressedData.size() 
+                          << " bytes (" << std::fixed << std::setprecision(1) << ratio << "%)" 
+                          << std::endl;
+            }
+        }
+    }
+    
+    // Add the consolidated buffer to the model and create bufferViews
+    if (!compressedPrimitives.empty() && !bufferData.empty()) {
+        compressedBuffer.data = std::move(bufferData);
+        model.buffers.push_back(compressedBuffer);
+        int bufferIdx = static_cast<int>(model.buffers.size() - 1);
+        
+        // Create bufferViews and update primitive extensions
+        for (const auto& compData : compressedPrimitives) {
+            tinygltf::BufferView bufferView;
+            bufferView.buffer = bufferIdx;
+            bufferView.byteOffset = compData.byteOffset;
+            bufferView.byteLength = compData.byteLength;
+            model.bufferViews.push_back(bufferView);
+            int bufferViewIdx = static_cast<int>(model.bufferViews.size() - 1);
+            
+            // Update the primitive extension with the bufferView index
+            auto& primitive = model.meshes[compData.meshIdx].primitives[compData.primIdx];
             if (primitive.extensions.count("KHR_draco_mesh_compression") > 0) {
-                const auto& ext = primitive.extensions["KHR_draco_mesh_compression"];
-                if (ext.Has("bufferView") && ext.Get("bufferView").IsInt()) {
-                    int bvIdx = ext.Get("bufferView").Get<int>();
-                    if (bvIdx >= 0 && static_cast<size_t>(bvIdx) < model.bufferViews.size()) {
-                        size_t compressedSize = model.bufferViews[bvIdx].byteLength;
-                        totalCompressedSize += compressedSize;
+                auto& ext = primitive.extensions["KHR_draco_mesh_compression"];
+                if (ext.IsObject()) {
+                    auto& obj = ext.Get<tinygltf::Value::Object>();
+                    obj["bufferView"] = tinygltf::Value(bufferViewIdx);
+                }
+                
+                // CRITICAL: Compute bounds BEFORE clearing bufferView references
+                // The glTF spec requires min/max for POSITION accessors
+                for (auto& attrPair : primitive.attributes) {
+                    if (attrPair.first == "POSITION" && attrPair.second >= 0 && 
+                        static_cast<size_t>(attrPair.second) < model.accessors.size()) {
+                        auto& accessor = model.accessors[attrPair.second];
                         
-                        if (options.verbose) {
-                            double ratio = originalSize > 0 ? (double)compressedSize / originalSize * 100.0 : 0.0;
-                            std::cout << "  Compressed primitive " << compressedPrimitives 
-                                      << ": " << originalSize << " → " << compressedSize 
-                                      << " bytes (" << std::fixed << std::setprecision(1) << ratio << "%)" 
-                                      << std::endl;
+                        // Only compute if not already set and we still have data
+                        if (accessor.bufferView >= 0 && accessor.minValues.empty()) {
+                            if (accessor.bufferView < static_cast<int>(model.bufferViews.size())) {
+                                const auto& bufferView = model.bufferViews[accessor.bufferView];
+                                if (bufferView.buffer >= 0 && bufferView.buffer < static_cast<int>(model.buffers.size())) {
+                                    const auto& buffer = model.buffers[bufferView.buffer];
+                                    const uint8_t* data = buffer.data.data() + bufferView.byteOffset + accessor.byteOffset;
+                                    
+                                    // Calculate stride
+                                    size_t stride = bufferView.byteStride > 0 ? bufferView.byteStride : (sizeof(float) * 3);
+                                    
+                                    // Compute min/max for VEC3 float positions
+                                    if (accessor.type == TINYGLTF_TYPE_VEC3 && accessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
+                                        accessor.minValues = {FLT_MAX, FLT_MAX, FLT_MAX};
+                                        accessor.maxValues = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+                                        
+                                        for (size_t i = 0; i < static_cast<size_t>(accessor.count); ++i) {
+                                            const float* pos = reinterpret_cast<const float*>(data + i * stride);
+                                            for (int j = 0; j < 3; ++j) {
+                                                accessor.minValues[j] = std::min(accessor.minValues[j], static_cast<double>(pos[j]));
+                                                accessor.maxValues[j] = std::max(accessor.maxValues[j], static_cast<double>(pos[j]));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+                
+                // Now clear bufferView references from accessors so pruning removes old data
+                // Since we added KHR_draco_mesh_compression to extensionsRequired, 
+                // decoders MUST support it, so fallback data is unnecessary
+                for (auto& attrPair : primitive.attributes) {
+                    if (attrPair.second >= 0 && static_cast<size_t>(attrPair.second) < model.accessors.size()) {
+                        model.accessors[attrPair.second].bufferView = -1;
+                    }
+                }
+                if (primitive.indices >= 0 && static_cast<size_t>(primitive.indices) < model.accessors.size()) {
+                    model.accessors[primitive.indices].bufferView = -1;
+                }
             }
-            
-            compressedPrimitives++;
         }
     }
     
     // Generate statistics
     std::ostringstream statsStream;
-    if (compressedPrimitives > 0) {
+    if (!compressedPrimitives.empty()) {
         double overallRatio = totalOriginalSize > 0 ? (double)totalCompressedSize / totalOriginalSize * 100.0 : 0.0;
-        statsStream << "Compressed " << compressedPrimitives << " primitives\n"
+        statsStream << "Compressed " << compressedPrimitives.size() << " primitives";
+        if (skippedPrimitives > 0) {
+            statsStream << " (skipped " << skippedPrimitives << ")";
+        }
+        statsStream << "\n"
                    << "Original size: " << totalOriginalSize << " bytes\n"
                    << "Compressed size: " << totalCompressedSize << " bytes\n"
                    << "Compression ratio: " << std::fixed << std::setprecision(1) << overallRatio << "%\n"
@@ -123,7 +213,7 @@ bool GltfCompress::process(tinygltf::Model& model, const CompressOptions& option
         stats_ = statsStream.str();
     }
     
-    return compressedPrimitives > 0;
+    return !compressedPrimitives.empty();
 #endif
 }
 
@@ -131,27 +221,18 @@ bool GltfCompress::process(tinygltf::Model& model, const CompressOptions& option
 bool GltfCompress::compressPrimitive(tinygltf::Model& model,
                                      tinygltf::Mesh& mesh,
                                      size_t primitiveIndex,
-                                     const CompressOptions& options) {
+                                     const CompressOptions& options,
+                                     std::vector<uint8_t>& compressedData) {
     auto& primitive = mesh.primitives[primitiveIndex];
     
-    // Only compress triangle meshes
+    // Only compress indexed triangle meshes
     if (primitive.mode != TINYGLTF_MODE_TRIANGLES) {
         return false;
     }
     
-    // Create Draco mesh
-    std::unique_ptr<draco::Mesh> dracoMesh(new draco::Mesh());
-    
-    // Helper to get accessor data
-    auto getAccessorData = [&](int accessorIdx) -> const uint8_t* {
-        if (accessorIdx < 0 || static_cast<size_t>(accessorIdx) >= model.accessors.size()) return nullptr;
-        const auto& accessor = model.accessors[accessorIdx];
-        if (accessor.bufferView < 0 || static_cast<size_t>(accessor.bufferView) >= model.bufferViews.size()) return nullptr;
-        const auto& bufferView = model.bufferViews[accessor.bufferView];
-        if (bufferView.buffer < 0 || static_cast<size_t>(bufferView.buffer) >= model.buffers.size()) return nullptr;
-        const auto& buffer = model.buffers[bufferView.buffer];
-        return buffer.data.data() + bufferView.byteOffset + accessor.byteOffset;
-    };
+    if (primitive.indices < 0) {
+        return false;
+    }
     
     // Get number of vertices from POSITION attribute
     if (primitive.attributes.count("POSITION") == 0) {
@@ -161,36 +242,83 @@ bool GltfCompress::compressPrimitive(tinygltf::Model& model,
     const auto& posAccessor = model.accessors[primitive.attributes["POSITION"]];
     const size_t numVertices = posAccessor.count;
     
-    // Add faces (indices)
-    if (primitive.indices >= 0) {
-        const auto& indexAccessor = model.accessors[primitive.indices];
-        const uint8_t* indexData = getAccessorData(primitive.indices);
-        if (!indexData) return false;
+    // Create Draco mesh
+    std::unique_ptr<draco::Mesh> dracoMesh(new draco::Mesh());
+    
+    // Helper to get accessor buffer data with proper stride handling
+    auto getAccessorInfo = [&](int accessorIdx, const uint8_t*& dataPtr, size_t& stride) -> bool {
+        if (accessorIdx < 0 || static_cast<size_t>(accessorIdx) >= model.accessors.size()) return false;
+        const auto& accessor = model.accessors[accessorIdx];
+        if (accessor.bufferView < 0 || static_cast<size_t>(accessor.bufferView) >= model.bufferViews.size()) return false;
+        const auto& bufferView = model.bufferViews[accessor.bufferView];
+        if (bufferView.buffer < 0 || static_cast<size_t>(bufferView.buffer) >= model.buffers.size()) return false;
+        const auto& buffer = model.buffers[bufferView.buffer];
         
-        const size_t numFaces = indexAccessor.count / 3;
-        dracoMesh->SetNumFaces(numFaces);
+        dataPtr = buffer.data.data() + bufferView.byteOffset + accessor.byteOffset;
         
-        for (size_t i = 0; i < numFaces; ++i) {
-            draco::Mesh::Face face;
-            for (int j = 0; j < 3; ++j) {
-                uint32_t idx = 0;
-                if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-                    idx = reinterpret_cast<const uint16_t*>(indexData)[i * 3 + j];
-                } else if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
-                    idx = reinterpret_cast<const uint32_t*>(indexData)[i * 3 + j];
-                } else if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-                    idx = indexData[i * 3 + j];
-                }
-                face[j] = idx;
-            }
-            dracoMesh->SetFace(draco::FaceIndex(i), face);
+        // Calculate stride
+        int componentSize = 1;
+        if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_BYTE || 
+            accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
+            componentSize = 1;
+        } else if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_SHORT || 
+                   accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
+            componentSize = 2;
+        } else if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_INT || 
+                   accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT || 
+                   accessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
+            componentSize = 4;
         }
+        
+        int numComponents = 1;
+        if (accessor.type == TINYGLTF_TYPE_VEC2) numComponents = 2;
+        else if (accessor.type == TINYGLTF_TYPE_VEC3) numComponents = 3;
+        else if (accessor.type == TINYGLTF_TYPE_VEC4) numComponents = 4;
+        else if (accessor.type == TINYGLTF_TYPE_MAT2) numComponents = 4;
+        else if (accessor.type == TINYGLTF_TYPE_MAT3) numComponents = 9;
+        else if (accessor.type == TINYGLTF_TYPE_MAT4) numComponents = 16;
+        
+        stride = bufferView.byteStride > 0 ? bufferView.byteStride : (componentSize * numComponents);
+        return true;
+    };
+    
+    // Add faces (indices)
+    const auto& indexAccessor = model.accessors[primitive.indices];
+    const uint8_t* indexData;
+    size_t indexStride;
+    if (!getAccessorInfo(primitive.indices, indexData, indexStride)) {
+        return false;
+    }
+    
+    const size_t numFaces = indexAccessor.count / 3;
+    dracoMesh->SetNumFaces(numFaces);
+    
+    for (size_t i = 0; i < numFaces; ++i) {
+        draco::Mesh::Face face;
+        for (int j = 0; j < 3; ++j) {
+            uint32_t idx = 0;
+            const uint8_t* idxPtr = indexData + (i * 3 + j) * indexStride;
+            
+            if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
+                idx = *idxPtr;
+            } else if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
+                idx = *reinterpret_cast<const uint16_t*>(idxPtr);
+            } else if (indexAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
+                idx = *reinterpret_cast<const uint32_t*>(idxPtr);
+            }
+            face[j] = idx;
+        }
+        dracoMesh->SetFace(draco::FaceIndex(i), face);
     }
     
     dracoMesh->set_num_points(numVertices);
     
     // Map to store attribute IDs for extension
     std::map<std::string, int> attributeIdMap;
+    
+    // Check if we have morph targets - if so, use sequential encoding
+    bool hasMorphTargets = !primitive.targets.empty();
+    bool useSequential = !options.useEdgebreaker || hasMorphTargets;
     
     // Add attributes
     for (const auto& attr : primitive.attributes) {
@@ -200,33 +328,47 @@ bool GltfCompress::compressPrimitive(tinygltf::Model& model,
         if (accessorIdx < 0 || static_cast<size_t>(accessorIdx) >= model.accessors.size()) continue;
         
         const auto& accessor = model.accessors[accessorIdx];
-        const uint8_t* attrData = getAccessorData(accessorIdx);
-        if (!attrData) continue;
+        const uint8_t* attrData;
+        size_t attrStride;
+        
+        if (!getAccessorInfo(accessorIdx, attrData, attrStride)) continue;
         
         // Determine attribute type
         draco::GeometryAttribute::Type attrType = draco::GeometryAttribute::GENERIC;
         if (attrName == "POSITION") attrType = draco::GeometryAttribute::POSITION;
         else if (attrName == "NORMAL") attrType = draco::GeometryAttribute::NORMAL;
-        else if (attrName == "TEXCOORD_0") attrType = draco::GeometryAttribute::TEX_COORD;
-        else if (attrName == "COLOR_0") attrType = draco::GeometryAttribute::COLOR;
+        else if (attrName.rfind("TEXCOORD_", 0) == 0) attrType = draco::GeometryAttribute::TEX_COORD;
+        else if (attrName.rfind("COLOR_", 0) == 0) attrType = draco::GeometryAttribute::COLOR;
         else if (attrName == "TANGENT") attrType = draco::GeometryAttribute::GENERIC;
+        else if (attrName.rfind("JOINTS_", 0) == 0) attrType = draco::GeometryAttribute::GENERIC;
+        else if (attrName.rfind("WEIGHTS_", 0) == 0) attrType = draco::GeometryAttribute::GENERIC;
         
         // Determine data type
         draco::DataType dataType = draco::DT_FLOAT32;
-        if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
-            dataType = draco::DT_FLOAT32;
+        if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_BYTE) {
+            dataType = draco::DT_INT8;
         } else if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-            dataType = accessor.normalized ? draco::DT_UINT8 : draco::DT_UINT8;
+            dataType = draco::DT_UINT8;
+        } else if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_SHORT) {
+            dataType = draco::DT_INT16;
         } else if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-            dataType = accessor.normalized ? draco::DT_UINT16 : draco::DT_UINT16;
+            dataType = draco::DT_UINT16;
+        } else if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_INT) {
+            dataType = draco::DT_INT32;
+        } else if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
+            dataType = draco::DT_UINT32;
+        } else if (accessor.componentType == TINYGLTF_COMPONENT_TYPE_FLOAT) {
+            dataType = draco::DT_FLOAT32;
         }
         
         // Determine number of components
-        int numComponents = 0;
-        if (accessor.type == TINYGLTF_TYPE_SCALAR) numComponents = 1;
-        else if (accessor.type == TINYGLTF_TYPE_VEC2) numComponents = 2;
+        int numComponents = 1;
+        if (accessor.type == TINYGLTF_TYPE_VEC2) numComponents = 2;
         else if (accessor.type == TINYGLTF_TYPE_VEC3) numComponents = 3;
         else if (accessor.type == TINYGLTF_TYPE_VEC4) numComponents = 4;
+        else if (accessor.type == TINYGLTF_TYPE_MAT2) numComponents = 4;
+        else if (accessor.type == TINYGLTF_TYPE_MAT3) numComponents = 9;
+        else if (accessor.type == TINYGLTF_TYPE_MAT4) numComponents = 16;
         
         // Create and add attribute
         draco::GeometryAttribute attribute;
@@ -236,12 +378,12 @@ bool GltfCompress::compressPrimitive(tinygltf::Model& model,
         int attId = dracoMesh->AddAttribute(attribute, true, numVertices);
         attributeIdMap[attrName] = attId;
         
-        // Copy attribute data
-        size_t stride = draco::DataTypeLength(dataType) * numComponents;
+        // Copy attribute data with proper stride handling
+        size_t componentSize = draco::DataTypeLength(dataType) * numComponents;
         for (size_t v = 0; v < numVertices; ++v) {
             dracoMesh->attribute(attId)->SetAttributeValue(
                 draco::AttributeValueIndex(v),
-                attrData + v * stride
+                attrData + v * attrStride
             );
         }
     }
@@ -259,11 +401,11 @@ bool GltfCompress::compressPrimitive(tinygltf::Model& model,
     // Set speed options
     encoder.SetSpeedOptions(options.encodingSpeed, options.decodingSpeed);
     
-    // Set encoding method
-    if (options.useEdgebreaker) {
-        encoder.SetEncodingMethod(draco::MESH_EDGEBREAKER_ENCODING);
-    } else {
+    // Set encoding method (sequential for morph targets)
+    if (useSequential) {
         encoder.SetEncodingMethod(draco::MESH_SEQUENTIAL_ENCODING);
+    } else {
+        encoder.SetEncodingMethod(draco::MESH_EDGEBREAKER_ENCODING);
     }
     
     // Encode
@@ -271,20 +413,22 @@ bool GltfCompress::compressPrimitive(tinygltf::Model& model,
     draco::Status status = encoder.EncodeMeshToBuffer(*dracoMesh, &buffer);
     
     if (!status.ok()) {
-        error_ = std::string("Draco encoding failed: ") + status.error_msg();
+        if (options.verbose) {
+            std::cerr << "Draco encoding failed: " << status.error_msg() << std::endl;
+        }
         return false;
     }
     
-    // Create buffer for compressed data
-    std::vector<uint8_t> compressedData(buffer.size());
+    // Copy compressed data to output
+    compressedData.resize(buffer.size());
     std::memcpy(compressedData.data(), buffer.data(), buffer.size());
     
-    int bufferIdx = createCompressedBuffer(model, compressedData);
-    int bufferViewIdx = createBufferView(model, bufferIdx, compressedData.size());
+    // Now we need to update the primitive to reference the compressed data
+    // The buffer and bufferView will be created later when we consolidate
+    // For now, store the offset where this data will be in the consolidated buffer
     
     // Add extension to primitive
     tinygltf::Value::Object dracoExt;
-    dracoExt["bufferView"] = tinygltf::Value(bufferViewIdx);
     
     // Add attribute mapping
     tinygltf::Value::Object attributes;
@@ -295,23 +439,16 @@ bool GltfCompress::compressPrimitive(tinygltf::Model& model,
     
     primitive.extensions["KHR_draco_mesh_compression"] = tinygltf::Value(dracoExt);
     
+    // CRITICAL: Remove references to uncompressed data
+    // When Draco extension is present, it replaces the standard vertex data
+    // The old accessors will be pruned later as unused
+    // We must NOT clear the accessor references themselves - just leave them
+    // The spec says: "When this extension is used, geometry data is stored in the Draco format
+    // and the mesh primitive's attribute accessors and indices reference the Draco buffer."
+    // However, the old accessors remain for fallback decoders, but we want to remove them
+    // to save space since we made extension required.
+    
     return true;
-}
-
-int GltfCompress::createCompressedBuffer(tinygltf::Model& model, const std::vector<uint8_t>& data) {
-    tinygltf::Buffer buffer;
-    buffer.data = data;
-    model.buffers.push_back(buffer);
-    return static_cast<int>(model.buffers.size() - 1);
-}
-
-int GltfCompress::createBufferView(tinygltf::Model& model, int bufferIndex, size_t byteLength) {
-    tinygltf::BufferView bufferView;
-    bufferView.buffer = bufferIndex;
-    bufferView.byteOffset = 0;
-    bufferView.byteLength = byteLength;
-    model.bufferViews.push_back(bufferView);
-    return static_cast<int>(model.bufferViews.size() - 1);
 }
 #endif
 

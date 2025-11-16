@@ -20,7 +20,8 @@ class ProgressReporter {
 public:
     enum class Format {
         Text,
-        JSON
+        JSON,
+        Silent
     };
 
     using ProgressCallback = std::function<void(const std::string&)>;
@@ -41,7 +42,9 @@ public:
                 const std::string& message, 
                 double progress = -1.0,
                 const std::string& details = "") {
-        if (format_ == Format::JSON) {
+        if (format_ == Format::Silent) {
+            return;
+        } else if (format_ == Format::JSON) {
             reportJSON(operation, message, progress, details);
         } else {
             reportText(operation, message, progress, details);
@@ -52,7 +55,9 @@ public:
      * @brief Report an error
      */
     void error(const std::string& operation, const std::string& message) {
-        if (format_ == Format::JSON) {
+        if (format_ == Format::Silent) {
+            out_ << "Error [" << operation << "]: " << message << std::endl;
+        } else if (format_ == Format::JSON) {
             out_ << "{\"type\":\"error\",\"operation\":\"" << escapeJSON(operation) 
                  << "\",\"message\":\"" << escapeJSON(message) << "\"}" << std::endl;
         } else {
@@ -64,7 +69,9 @@ public:
      * @brief Report success
      */
     void success(const std::string& operation, const std::string& message) {
-        if (format_ == Format::JSON) {
+        if (format_ == Format::Silent) {
+            out_ << message << std::endl;
+        } else if (format_ == Format::JSON) {
             out_ << "{\"type\":\"success\",\"operation\":\"" << escapeJSON(operation) 
                  << "\",\"message\":\"" << escapeJSON(message) << "\"}" << std::endl;
         } else {

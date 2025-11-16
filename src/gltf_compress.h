@@ -82,13 +82,8 @@ private:
     bool compressPrimitive(tinygltf::Model& model,
                           tinygltf::Mesh& mesh,
                           size_t primitiveIndex,
-                          const CompressOptions& options);
-    
-    // Create a new buffer to store compressed data
-    int createCompressedBuffer(tinygltf::Model& model, const std::vector<uint8_t>& data);
-    
-    // Create a new buffer view for the compressed data
-    int createBufferView(tinygltf::Model& model, int bufferIndex, size_t byteLength);
+                          const CompressOptions& options,
+                          std::vector<uint8_t>& compressedData);
 #endif
 };
 
