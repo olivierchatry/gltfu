@@ -8,6 +8,7 @@
 #include "gltf_simplify.h"
 #include "gltf_info.h"
 #include "gltf_compress.h"
+#include "gltf_bounds.h"
 #include "progress_reporter.h"
 
 #include <iostream>
@@ -1147,6 +1148,13 @@ int main(int argc, char** argv) {
                 progress.error("optim", "Prune operation failed");
                 return 1;
             }
+        }
+        
+        // Step 8: Compute bounds for all POSITION accessors (required by spec)
+        progress.report("optim", "Computing accessor bounds", 0.93);
+        int boundsComputed = gltfu::GltfBounds::computeAllBounds(model);
+        if (optimVerbose && boundsComputed > 0) {
+            std::cout << "  Computed bounds for " << boundsComputed << " accessors" << std::endl;
         }
         
         // Final step: Write output with proper settings

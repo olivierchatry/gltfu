@@ -89,13 +89,14 @@ void GltfInfo::analyzeMeshes() {
         for (const auto& primitive : mesh.primitives) {
             // Count vertices
             auto posIt = primitive.attributes.find("POSITION");
-            if (posIt != primitive.attributes.end() && posIt->second >= 0) {
+            if (posIt != primitive.attributes.end() && posIt->second >= 0 && 
+                posIt->second < static_cast<int>(model_.accessors.size())) {
                 const auto& accessor = model_.accessors[posIt->second];
                 stats_.vertexCount += accessor.count;
             }
             
             // Count triangles
-            if (primitive.indices >= 0) {
+            if (primitive.indices >= 0 && primitive.indices < static_cast<int>(model_.accessors.size())) {
                 const auto& accessor = model_.accessors[primitive.indices];
                 int mode = primitive.mode;
                 
@@ -111,7 +112,8 @@ void GltfInfo::analyzeMeshes() {
                 else if (mode == 6) {
                     stats_.triangleCount += accessor.count - 2;
                 }
-            } else if (posIt != primitive.attributes.end() && posIt->second >= 0) {
+            } else if (posIt != primitive.attributes.end() && posIt->second >= 0 && 
+                       posIt->second < static_cast<int>(model_.accessors.size())) {
                 // No indices, assume TRIANGLES mode
                 const auto& accessor = model_.accessors[posIt->second];
                 stats_.triangleCount += accessor.count / 3;

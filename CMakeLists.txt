@@ -87,6 +87,8 @@ add_executable(gltfu
     src/gltf_info.h
     src/gltf_compress.cpp
     src/gltf_compress.h
+    src/gltf_bounds.cpp
+    src/gltf_bounds.h
     third_party/meshoptimizer_simplifier.cpp
     third_party/meshoptimizer_allocator.cpp
 )

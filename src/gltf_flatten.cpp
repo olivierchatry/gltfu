@@ -325,6 +325,9 @@ int GltfFlatten::process(tinygltf::Model& model, bool cleanup) {
     
     if (totalNodes == 0) return 0;
     
+    // Check for debug mode
+    bool debug = std::getenv("GLTFU_DEBUG_FLATTEN") != nullptr;
+    
     // Build parent map once (O(n) instead of O(n²))
     std::vector<int> parentMap(totalNodes, -1);
     for (size_t i = 0; i < totalNodes; ++i) {
@@ -360,7 +363,8 @@ int GltfFlatten::process(tinygltf::Model& model, bool cleanup) {
     std::vector<bool> hasConstrainedAncestor(totalNodes, false);
     
     for (size_t i = 0; i < totalNodes; ++i) {
-        int current = static_cast<int>(i);
+        // Walk up parent chain (not including current node)
+        int current = parentMap[i];
         bool constrained = false;
         
         // Walk up to find constrained ancestor
@@ -377,8 +381,20 @@ int GltfFlatten::process(tinygltf::Model& model, bool cleanup) {
     }
     
     // (4) Collect nodes to flatten (nodes with parents that aren't constrained)
-    std::vector<int> nodesToFlatten;
+    // IMPORTANT: Only flatten leaf nodes (nodes without children) to avoid transform corruption
+    std::vector<std::pair<int, int>> nodesToFlatten; // pair of (depth, nodeIdx)
     nodesToFlatten.reserve(totalNodes / 2); // Estimate
+    
+    // Compute depth for each node
+    auto getDepth = [&](int nodeIdx) {
+        int depth = 0;
+        int current = parentMap[nodeIdx];
+        while (current >= 0) {
+            depth++;
+            current = parentMap[current];
+        }
+        return depth;
+    };
     
     for (size_t i = 0; i < totalNodes; ++i) {
         // Skip if constrained
@@ -386,14 +402,27 @@ int GltfFlatten::process(tinygltf::Model& model, bool cleanup) {
             continue;
         }
         
+        // Skip if has children (only flatten leaf nodes)
+        if (!model.nodes[i].children.empty()) {
+            continue;
+        }
+        
         // Only flatten if has parent
         if (parentMap[i] >= 0) {
-            nodesToFlatten.push_back(static_cast<int>(i));
+            int depth = getDepth(static_cast<int>(i));
+            nodesToFlatten.push_back({depth, static_cast<int>(i)});
         }
     }
     
+    // Sort by depth (deepest first) so children are flattened before parents
+    std::sort(nodesToFlatten.begin(), nodesToFlatten.end(), 
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    
     // (5) Flatten collected nodes
-    for (int nodeIdx : nodesToFlatten) {
+    for (const auto& pair : nodesToFlatten) {
+        int nodeIdx = pair.second;
+        int depth = pair.first;
+        
         // Find which scenes contain this node's root
         int rootNode = nodeIdx;
         while (parentMap[rootNode] >= 0) {
@@ -411,18 +440,38 @@ int GltfFlatten::process(tinygltf::Model& model, bool cleanup) {
         int parentIdx = parentMap[nodeIdx];
         if (parentIdx < 0) continue; // Already at root
         
-        // Compute world matrix by walking up parent chain
+        // Compute world matrix by walking up parent chain (EXCLUDING the node itself)
         std::vector<double> worldMatrix = identityMatrix();
-        int current = nodeIdx;
+        int current = parentIdx; // Start from parent, not the node itself
         std::vector<int> ancestors;
         while (current >= 0) {
             ancestors.push_back(current);
             current = parentMap[current];
         }
         
+        if (debug) {
+            std::cout << "Flattening node " << nodeIdx << " (depth " << depth 
+                      << ", root " << rootNode << ")\n";
+            std::cout << "  Ancestors: [";
+            for (auto it = ancestors.rbegin(); it != ancestors.rend(); ++it) {
+                std::cout << *it << " ";
+            }
+            std::cout << "]\n";
+        }
+        
+        // Multiply parent transforms to get parent's world matrix
         for (auto it = ancestors.rbegin(); it != ancestors.rend(); ++it) {
             std::vector<double> localMatrix = getNodeMatrix(model.nodes[*it]);
             worldMatrix = multiplyMatrices(worldMatrix, localMatrix);
+        }
+        
+        // Now multiply by node's local transform to get node's world position
+        std::vector<double> nodeLocalMatrix = getNodeMatrix(model.nodes[nodeIdx]);
+        worldMatrix = multiplyMatrices(worldMatrix, nodeLocalMatrix);
+        
+        if (debug) {
+            std::cout << "  World position: [" << worldMatrix[12] << ", " 
+                      << worldMatrix[13] << ", " << worldMatrix[14] << "]\n";
         }
         
         // Apply world transform to node

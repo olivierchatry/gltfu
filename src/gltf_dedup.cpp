@@ -172,7 +172,8 @@ void GltfDedup::dedupAccessors(tinygltf::Model& model, const Options& options) {
         if (indices.size() < 2) continue;
         
         groupsProcessed++;
-        if (groupsProcessed % 100 == 0 || indices.size() > 1000) {
+        // Only report progress for large groups (>1000 accessors) or every 100 groups
+        if ((groupsProcessed % 100 == 0 || indices.size() > 1000) && options.verbose) {
             double groupProgress = 0.5 + 0.3 * static_cast<double>(groupsProcessed) / hashGroups.size();
             reportProgress("Group " + std::to_string(groupsProcessed) + "/" + std::to_string(hashGroups.size()), 
                          groupProgress, std::to_string(indices.size()) + " accessors");

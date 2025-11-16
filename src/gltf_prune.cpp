@@ -161,6 +161,24 @@ bool GltfPrune::process(tinygltf::Model& model, const PruneOptions& options) {
                     }
                 }
             }
+            
+            // Update Draco compression extension bufferView
+            if (prim.extensions.count("KHR_draco_mesh_compression") > 0) {
+                auto& dracoExt = prim.extensions.at("KHR_draco_mesh_compression");
+                if (dracoExt.Has("bufferView") && dracoExt.Get("bufferView").IsInt()) {
+                    int oldBvIdx = dracoExt.Get("bufferView").Get<int>();
+                    if (oldBvIdx >= 0 && oldBvIdx < static_cast<int>(bufferViewMap.size())) {
+                        int newBvIdx = bufferViewMap[oldBvIdx];
+                        if (newBvIdx != -1) {
+                            // Need to get the mutable object and update it
+                            if (dracoExt.IsObject()) {
+                                auto& obj = dracoExt.Get<tinygltf::Value::Object>();
+                                obj["bufferView"] = tinygltf::Value(newBvIdx);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -443,6 +461,21 @@ void GltfPrune::markMesh(int meshIdx,
             for (const auto& attr : target) {
                 markAccessor(attr.second, model, usedBufferViews, usedBuffers);
                 usedAccessors.insert(attr.second);
+            }
+        }
+        
+        // Mark Draco compression extension bufferView
+        if (prim.extensions.count("KHR_draco_mesh_compression") > 0) {
+            const auto& dracoExt = prim.extensions.at("KHR_draco_mesh_compression");
+            if (dracoExt.Has("bufferView") && dracoExt.Get("bufferView").IsInt()) {
+                int bvIdx = dracoExt.Get("bufferView").Get<int>();
+                if (bvIdx >= 0 && bvIdx < static_cast<int>(model.bufferViews.size())) {
+                    usedBufferViews.insert(bvIdx);
+                    const auto& bv = model.bufferViews[bvIdx];
+                    if (bv.buffer >= 0) {
+                        usedBuffers.insert(bv.buffer);
+                    }
+                }
             }
         }
     }
