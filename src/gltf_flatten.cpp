@@ -25,17 +25,37 @@ static void decomposeMatrix(const std::vector<double>& mat,
     // Extract translation (rightmost column)
     translation = {mat[12], mat[13], mat[14]};
     
-    // Extract scale
+    // Extract scale with proper sign handling
     double sx = std::sqrt(mat[0]*mat[0] + mat[1]*mat[1] + mat[2]*mat[2]);
     double sy = std::sqrt(mat[4]*mat[4] + mat[5]*mat[5] + mat[6]*mat[6]);
     double sz = std::sqrt(mat[8]*mat[8] + mat[9]*mat[9] + mat[10]*mat[10]);
+    
+    // Check for negative scale using determinant
+    // det(M) = det(R) * sx * sy * sz, and det(R) = 1 for pure rotation
+    // So if det(M) < 0, one of the scales must be negative
+    double det = mat[0] * (mat[5]*mat[10] - mat[6]*mat[9])
+               - mat[1] * (mat[4]*mat[10] - mat[6]*mat[8])
+               + mat[2] * (mat[4]*mat[9] - mat[5]*mat[8]);
+    
+    if (det < 0) {
+        sz = -sz; // By convention, negate Z scale for negative determinant
+    }
+    
     scale = {sx, sy, sz};
     
     // Extract rotation (normalized rotation matrix)
-    std::vector<double> rotMat(9);
-    if (sx > 0) { rotMat[0] = mat[0]/sx; rotMat[1] = mat[1]/sx; rotMat[2] = mat[2]/sx; }
-    if (sy > 0) { rotMat[3] = mat[4]/sy; rotMat[4] = mat[5]/sy; rotMat[5] = mat[6]/sy; }
-    if (sz > 0) { rotMat[6] = mat[8]/sz; rotMat[7] = mat[9]/sz; rotMat[8] = mat[10]/sz; }
+    // Initialize to identity to handle zero scale cases
+    std::vector<double> rotMat = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    
+    if (std::abs(sx) > 1e-10) { 
+        rotMat[0] = mat[0]/sx; rotMat[1] = mat[1]/sx; rotMat[2] = mat[2]/sx; 
+    }
+    if (std::abs(sy) > 1e-10) { 
+        rotMat[3] = mat[4]/sy; rotMat[4] = mat[5]/sy; rotMat[5] = mat[6]/sy; 
+    }
+    if (std::abs(sz) > 1e-10) { 
+        rotMat[6] = mat[8]/sz; rotMat[7] = mat[9]/sz; rotMat[8] = mat[10]/sz; 
+    }
     
     // Convert rotation matrix to quaternion
     double trace = rotMat[0] + rotMat[4] + rotMat[8];
@@ -440,14 +460,68 @@ int GltfFlatten::process(tinygltf::Model& model, bool cleanup) {
         int parentIdx = parentMap[nodeIdx];
         if (parentIdx < 0) continue; // Already at root
         
-        // Compute world matrix by walking up parent chain (EXCLUDING the node itself)
-        std::vector<double> worldMatrix = identityMatrix();
-        int current = parentIdx; // Start from parent, not the node itself
+        // Check if we can skip matrix math when parent has identity transform
+        bool parentIsIdentity = true;
+        int current = parentIdx;
         std::vector<int> ancestors;
         while (current >= 0) {
             ancestors.push_back(current);
+            auto& ancestorNode = model.nodes[current];
+            
+            // Check if this ancestor has a non-identity transform
+            if (!ancestorNode.matrix.empty()) {
+                parentIsIdentity = false;
+            } else {
+                bool hasTranslation = !ancestorNode.translation.empty() && 
+                    (std::abs(ancestorNode.translation[0]) > 1e-10 ||
+                     std::abs(ancestorNode.translation[1]) > 1e-10 ||
+                     std::abs(ancestorNode.translation[2]) > 1e-10);
+                bool hasRotation = !ancestorNode.rotation.empty() &&
+                    (std::abs(ancestorNode.rotation[0]) > 1e-10 ||
+                     std::abs(ancestorNode.rotation[1]) > 1e-10 ||
+                     std::abs(ancestorNode.rotation[2]) > 1e-10 ||
+                     std::abs(ancestorNode.rotation[3] - 1.0) > 1e-10);
+                bool hasScale = !ancestorNode.scale.empty() &&
+                    (std::abs(ancestorNode.scale[0] - 1.0) > 1e-10 ||
+                     std::abs(ancestorNode.scale[1] - 1.0) > 1e-10 ||
+                     std::abs(ancestorNode.scale[2] - 1.0) > 1e-10);
+                
+                if (hasTranslation || hasRotation || hasScale) {
+                    parentIsIdentity = false;
+                }
+            }
+            
             current = parentMap[current];
         }
+        
+        // If all ancestors are identity, skip the expensive matrix operations
+        if (parentIsIdentity) {
+            if (debug) {
+                std::cout << "Flattening node " << nodeIdx << " (depth " << depth 
+                          << ", root " << rootNode << ") - ancestors are identity, skipping\n\n";
+            }
+            
+            // Just remove from parent and add to scene root
+            auto& parent = model.nodes[parentIdx];
+            parent.children.erase(
+                std::remove(parent.children.begin(), parent.children.end(), nodeIdx),
+                parent.children.end()
+            );
+            
+            for (int sceneIdx : sceneIndices) {
+                auto& scene = model.scenes[sceneIdx];
+                if (std::find(scene.nodes.begin(), scene.nodes.end(), nodeIdx) == scene.nodes.end()) {
+                    scene.nodes.push_back(nodeIdx);
+                }
+            }
+            
+            parentMap[nodeIdx] = -1;
+            flattenedCount++;
+            continue;
+        }
+        
+        // Compute world matrix by walking up parent chain (EXCLUDING the node itself)
+        std::vector<double> worldMatrix = identityMatrix();
         
         if (debug) {
             std::cout << "Flattening node " << nodeIdx << " (depth " << depth 
