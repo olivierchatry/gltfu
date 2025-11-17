@@ -1,530 +1,606 @@
 #include "gltf_join.h"
-#include <unordered_map>
-#include <unordered_set>
-#include <sstream>
+
 #include <algorithm>
-#include <iostream>
+#include <cstdint>
 #include <cstring>
+#include <iostream>
+#include <limits>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
 
 namespace gltfu {
-
 namespace {
-    const uint32_t EMPTY_U32 = 0xFFFFFFFF;
 
-    // Get typed array size for component type
-    size_t getTypedArraySize(int componentType) {
-        switch (componentType) {
-            case TINYGLTF_COMPONENT_TYPE_BYTE:
+struct ConstAccessorSpan {
+    const uint8_t* data = nullptr;
+    size_t stride = 0;
+    size_t elementSize = 0;
+    size_t count = 0;
+};
+
+struct AccessorSpan {
+    uint8_t* data = nullptr;
+    size_t stride = 0;
+    size_t elementSize = 0;
+    size_t count = 0;
+};
+
+size_t componentSize(int componentType) {
+    switch (componentType) {
+        case TINYGLTF_COMPONENT_TYPE_BYTE:
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+            return 1;
+        case TINYGLTF_COMPONENT_TYPE_SHORT:
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+            return 2;
+        case TINYGLTF_COMPONENT_TYPE_FLOAT:
+        case TINYGLTF_COMPONENT_TYPE_INT:
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+            return 4;
+        default:
+            return 4;
+    }
+}
+
+size_t componentCount(int type) {
+    switch (type) {
+        case TINYGLTF_TYPE_SCALAR: return 1;
+        case TINYGLTF_TYPE_VEC2: return 2;
+        case TINYGLTF_TYPE_VEC3: return 3;
+        case TINYGLTF_TYPE_VEC4: return 4;
+        case TINYGLTF_TYPE_MAT2: return 4;
+        case TINYGLTF_TYPE_MAT3: return 9;
+        case TINYGLTF_TYPE_MAT4: return 16;
+        default: return 1;
+    }
+}
+
+bool resolveConstSpan(const tinygltf::Model& model, int accessorIdx, ConstAccessorSpan& span) {
+    if (accessorIdx < 0 || accessorIdx >= static_cast<int>(model.accessors.size())) {
+        return false;
+    }
+
+    const auto& accessor = model.accessors[accessorIdx];
+    if (accessor.bufferView < 0 || accessor.bufferView >= static_cast<int>(model.bufferViews.size())) {
+        return false;
+    }
+
+    const auto& view = model.bufferViews[accessor.bufferView];
+    if (view.buffer < 0 || view.buffer >= static_cast<int>(model.buffers.size())) {
+        return false;
+    }
+
+    const auto& buffer = model.buffers[view.buffer];
+    const size_t elemSize = componentCount(accessor.type) * componentSize(accessor.componentType);
+    if (elemSize == 0) {
+        return false;
+    }
+
+    const size_t stride = view.byteStride > 0 ? static_cast<size_t>(view.byteStride) : elemSize;
+    const size_t offset = view.byteOffset + accessor.byteOffset;
+    const size_t required = accessor.count == 0 ? 0 : offset + stride * (accessor.count - 1) + elemSize;
+    if (required > buffer.data.size()) {
+        return false;
+    }
+
+    span.data = buffer.data.data() + offset;
+    span.stride = stride;
+    span.elementSize = elemSize;
+    span.count = accessor.count;
+    return true;
+}
+
+bool resolveSpan(tinygltf::Model& model, int accessorIdx, AccessorSpan& span) {
+    if (accessorIdx < 0 || accessorIdx >= static_cast<int>(model.accessors.size())) {
+        return false;
+    }
+
+    const auto& accessor = model.accessors[accessorIdx];
+    if (accessor.bufferView < 0 || accessor.bufferView >= static_cast<int>(model.bufferViews.size())) {
+        return false;
+    }
+
+    auto& view = model.bufferViews[accessor.bufferView];
+    if (view.buffer < 0 || view.buffer >= static_cast<int>(model.buffers.size())) {
+        return false;
+    }
+
+    auto& buffer = model.buffers[view.buffer];
+    const size_t elemSize = componentCount(accessor.type) * componentSize(accessor.componentType);
+    if (elemSize == 0) {
+        return false;
+    }
+
+    const size_t stride = view.byteStride > 0 ? static_cast<size_t>(view.byteStride) : elemSize;
+    const size_t offset = view.byteOffset + accessor.byteOffset;
+    const size_t required = accessor.count == 0 ? 0 : offset + stride * (accessor.count - 1) + elemSize;
+    if (required > buffer.data.size()) {
+        return false;
+    }
+
+    span.data = buffer.data.data() + offset;
+    span.stride = stride;
+    span.elementSize = elemSize;
+    span.count = accessor.count;
+    return true;
+}
+
+bool readIndices(const tinygltf::Model& model,
+                 int accessorIdx,
+                 std::vector<uint32_t>& indices) {
+    ConstAccessorSpan span;
+    if (!resolveConstSpan(model, accessorIdx, span)) {
+        return false;
+    }
+
+    indices.resize(span.count);
+    const uint8_t* src = span.data;
+
+    for (size_t i = 0; i < span.count; ++i) {
+        switch (model.accessors[accessorIdx].componentType) {
             case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
-                return 1;
-            case TINYGLTF_COMPONENT_TYPE_SHORT:
-            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
-                return 2;
-            case TINYGLTF_COMPONENT_TYPE_INT:
-            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
-            case TINYGLTF_COMPONENT_TYPE_FLOAT:
-                return 4;
+                indices[i] = src[i * span.stride];
+                break;
+            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+                const auto* value = reinterpret_cast<const uint16_t*>(src + i * span.stride);
+                indices[i] = *value;
+                break;
+            }
+            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT: {
+                const auto* value = reinterpret_cast<const uint32_t*>(src + i * span.stride);
+                indices[i] = *value;
+                break;
+            }
             default:
-                return 4;
+                return false;
         }
     }
 
-    // Get number of components for accessor type
-    size_t getNumComponents(int type) {
-        switch (type) {
-            case TINYGLTF_TYPE_SCALAR: return 1;
-            case TINYGLTF_TYPE_VEC2: return 2;
-            case TINYGLTF_TYPE_VEC3: return 3;
-            case TINYGLTF_TYPE_VEC4: return 4;
-            case TINYGLTF_TYPE_MAT2: return 4;
-            case TINYGLTF_TYPE_MAT3: return 9;
-            case TINYGLTF_TYPE_MAT4: return 16;
-            default: return 1;
-        }
-    }
-
-    // Create a new buffer and return its index
-    int createBuffer(tinygltf::Model& model, size_t size) {
-        tinygltf::Buffer buffer;
-        buffer.data.resize(size);
-        model.buffers.push_back(buffer);
-        return static_cast<int>(model.buffers.size() - 1);
-    }
-
-    // Create a new buffer view and return its index
-    int createBufferView(tinygltf::Model& model, int bufferIdx, size_t byteOffset, size_t byteLength, int target = 0) {
-        tinygltf::BufferView bv;
-        bv.buffer = bufferIdx;
-        bv.byteOffset = byteOffset;
-        bv.byteLength = byteLength;
-        if (target != 0) {
-            bv.target = target;
-        }
-        model.bufferViews.push_back(bv);
-        return static_cast<int>(model.bufferViews.size() - 1);
-    }
-
-    // Create a new accessor and return its index
-    int createAccessor(tinygltf::Model& model, int bufferViewIdx, int componentType, 
-                      size_t count, int type, size_t byteOffset = 0) {
-        tinygltf::Accessor accessor;
-        accessor.bufferView = bufferViewIdx;
-        accessor.byteOffset = byteOffset;
-        accessor.componentType = componentType;
-        accessor.count = count;
-        accessor.type = type;
-        model.accessors.push_back(accessor);
-        return static_cast<int>(model.accessors.size() - 1);
-    }
+    return true;
 }
 
-GltfJoin::GltfJoin() = default;
-GltfJoin::~GltfJoin() = default;
-
-size_t GltfJoin::getComponentSize(int componentType) const {
-    return getTypedArraySize(componentType);
-}
-
-size_t GltfJoin::getElementSize(int type) const {
-    return getNumComponents(type);
-}
-
-std::string GltfJoin::createPrimGroupKey(const tinygltf::Primitive& prim, 
-                                         const tinygltf::Model& model) const {
-    std::stringstream ss;
-    
-    // Material index
-    ss << "mat:" << prim.material << "|";
-    
-    // Mode
-    ss << "mode:" << prim.mode << "|";
-    
-    // Has indices?
-    ss << "idx:" << (prim.indices >= 0 ? 1 : 0) << "|";
-    
-    // Attributes (sorted by semantic)
-    std::vector<std::string> attrKeys;
-    for (const auto& attr : prim.attributes) {
-        attrKeys.push_back(attr.first);
+int chooseIndexComponentType(size_t vertexCount) {
+    if (vertexCount == 0) {
+        return TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
     }
-    std::sort(attrKeys.begin(), attrKeys.end());
-    
-    ss << "attrs:";
-    for (const auto& semantic : attrKeys) {
-        int accessorIdx = prim.attributes.at(semantic);
+
+    if (vertexCount - 1 <= std::numeric_limits<uint8_t>::max()) {
+        return TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+    }
+    if (vertexCount - 1 <= std::numeric_limits<uint16_t>::max()) {
+        return TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
+    }
+    return TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
+}
+
+int allocateAccessor(tinygltf::Model& model,
+                     size_t count,
+                     int type,
+                     int componentType,
+                     int target) {
+    const size_t elemSize = componentCount(type) * componentSize(componentType);
+    tinygltf::Buffer buffer;
+    buffer.data.resize(count * elemSize);
+    const int bufferIdx = static_cast<int>(model.buffers.size());
+    model.buffers.push_back(std::move(buffer));
+
+    tinygltf::BufferView view;
+    view.buffer = bufferIdx;
+    view.byteOffset = 0;
+    view.byteLength = count * elemSize;
+    if (target != 0) {
+        view.target = target;
+    }
+    const int viewIdx = static_cast<int>(model.bufferViews.size());
+    model.bufferViews.push_back(std::move(view));
+
+    tinygltf::Accessor accessor;
+    accessor.bufferView = viewIdx;
+    accessor.byteOffset = 0;
+    accessor.componentType = componentType;
+    accessor.count = count;
+    accessor.type = type;
+    model.accessors.push_back(std::move(accessor));
+
+    return static_cast<int>(model.accessors.size() - 1);
+}
+
+std::string primitiveKey(const tinygltf::Primitive& primitive,
+                         const tinygltf::Model& model) {
+    std::ostringstream stream;
+    stream << "mat:" << primitive.material << '|';
+    stream << "mode:" << primitive.mode << '|';
+    stream << "idx:" << (primitive.indices >= 0 ? 1 : 0) << '|';
+
+    std::vector<std::string> semantics;
+    semantics.reserve(primitive.attributes.size());
+    for (const auto& attribute : primitive.attributes) {
+        semantics.push_back(attribute.first);
+    }
+    std::sort(semantics.begin(), semantics.end());
+
+    stream << "attrs:";
+    for (const auto& semantic : semantics) {
+        const int accessorIdx = primitive.attributes.at(semantic);
         if (accessorIdx < 0 || accessorIdx >= static_cast<int>(model.accessors.size())) {
             continue;
         }
         const auto& accessor = model.accessors[accessorIdx];
-        ss << semantic << ":" 
-           << getElementSize(accessor.type) << ":" 
-           << accessor.componentType << "+";
+        stream << semantic << ':'
+               << componentCount(accessor.type) << ':'
+               << accessor.componentType << '+';
     }
-    
-    // Morph targets
-    ss << "|targets:" << prim.targets.size();
-    
-    return ss.str();
+
+    stream << "targets:" << primitive.targets.size();
+    return stream.str();
 }
 
-bool GltfJoin::arePrimitivesCompatible(const tinygltf::Primitive& prim1,
-                                       const tinygltf::Primitive& prim2,
-                                       const tinygltf::Model& model) const {
-    return createPrimGroupKey(prim1, model) == createPrimGroupKey(prim2, model);
-}
-
-void GltfJoin::remapAttribute(int srcAccessorIdx,
-                              int srcIndicesIdx,
-                              const std::vector<uint32_t>& remap,
-                              int dstAccessorIdx,
-                              tinygltf::Model& model) {
-    if (srcAccessorIdx < 0 || dstAccessorIdx < 0) return;
-    
-    const auto& srcAccessor = model.accessors[srcAccessorIdx];
-    const auto& dstAccessor = model.accessors[dstAccessorIdx];
-    
-    const auto& srcBV = model.bufferViews[srcAccessor.bufferView];
-    const auto& dstBV = model.bufferViews[dstAccessor.bufferView];
-    
-    auto& srcBuffer = model.buffers[srcBV.buffer];
-    auto& dstBuffer = model.buffers[dstBV.buffer];
-    
-    size_t elementSize = getElementSize(srcAccessor.type);
-    size_t componentSize = getComponentSize(srcAccessor.componentType);
-    size_t stride = elementSize * componentSize;
-    
-    const uint8_t* srcData = srcBuffer.data.data() + srcBV.byteOffset + srcAccessor.byteOffset;
-    uint8_t* dstData = dstBuffer.data.data() + dstBV.byteOffset + dstAccessor.byteOffset;
-    
-    // Build done array to avoid writing same vertex multiple times
-    std::vector<uint8_t> done(dstAccessor.count, 0);
-    
-    // Determine iteration count
-    size_t iterCount = srcAccessor.count;
-    std::vector<uint32_t> srcIndices;
-    
-    if (srcIndicesIdx >= 0) {
-        const auto& indicesAccessor = model.accessors[srcIndicesIdx];
-        const auto& indicesBV = model.bufferViews[indicesAccessor.bufferView];
-        const auto& indicesBuffer = model.buffers[indicesBV.buffer];
-        const uint8_t* indicesData = indicesBuffer.data.data() + indicesBV.byteOffset + indicesAccessor.byteOffset;
-        
-        srcIndices.resize(indicesAccessor.count);
-        iterCount = indicesAccessor.count;
-        
-        // Read indices based on component type
-        if (indicesAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-            const uint16_t* indices16 = reinterpret_cast<const uint16_t*>(indicesData);
-            for (size_t i = 0; i < indicesAccessor.count; ++i) {
-                srcIndices[i] = indices16[i];
-            }
-        } else if (indicesAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
-            const uint32_t* indices32 = reinterpret_cast<const uint32_t*>(indicesData);
-            for (size_t i = 0; i < indicesAccessor.count; ++i) {
-                srcIndices[i] = indices32[i];
-            }
-        } else if (indicesAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-            const uint8_t* indices8 = indicesData;
-            for (size_t i = 0; i < indicesAccessor.count; ++i) {
-                srcIndices[i] = indices8[i];
-            }
-        }
-    } else {
-        // No indices, iterate sequentially
-        srcIndices.resize(srcAccessor.count);
-        for (size_t i = 0; i < srcAccessor.count; ++i) {
-            srcIndices[i] = static_cast<uint32_t>(i);
-        }
-    }
-    
-    // Remap attributes
-    for (size_t i = 0; i < iterCount; ++i) {
-        uint32_t srcIndex = srcIndices[i];
-        uint32_t dstIndex = remap[srcIndex];
-        
-        if (dstIndex >= dstAccessor.count || done[dstIndex]) continue;
-        
-        const uint8_t* src = srcData + srcIndex * stride;
-        uint8_t* dst = dstData + dstIndex * stride;
-        
-        std::memcpy(dst, src, stride);
-        done[dstIndex] = 1;
+void writeIndexValue(AccessorSpan& span,
+                     size_t index,
+                     uint32_t value,
+                     int componentType) {
+    uint8_t* dst = span.data + index * span.stride;
+    switch (componentType) {
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
+            dst[0] = static_cast<uint8_t>(value);
+            break;
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
+            reinterpret_cast<uint16_t*>(dst)[0] = static_cast<uint16_t>(value);
+            break;
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
+            reinterpret_cast<uint32_t*>(dst)[0] = value;
+            break;
+        default:
+            break;
     }
 }
 
-void GltfJoin::remapIndices(int srcIndicesIdx,
-                            const std::vector<uint32_t>& remap,
-                            int dstIndicesIdx,
-                            size_t dstOffset,
-                            tinygltf::Model& model) {
-    if (srcIndicesIdx < 0 || dstIndicesIdx < 0) return;
-    
-    const auto& srcAccessor = model.accessors[srcIndicesIdx];
-    const auto& dstAccessor = model.accessors[dstIndicesIdx];
-    
-    const auto& srcBV = model.bufferViews[srcAccessor.bufferView];
-    const auto& dstBV = model.bufferViews[dstAccessor.bufferView];
-    
-    const auto& srcBuffer = model.buffers[srcBV.buffer];
-    auto& dstBuffer = model.buffers[dstBV.buffer];
-    
-    const uint8_t* srcData = srcBuffer.data.data() + srcBV.byteOffset + srcAccessor.byteOffset;
-    uint8_t* dstData = dstBuffer.data.data() + dstBV.byteOffset + dstAccessor.byteOffset;
-    
-    // Read source indices
-    std::vector<uint32_t> srcIndices(srcAccessor.count);
-    if (srcAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-        const uint16_t* indices16 = reinterpret_cast<const uint16_t*>(srcData);
-        for (size_t i = 0; i < srcAccessor.count; ++i) {
-            srcIndices[i] = indices16[i];
-        }
-    } else if (srcAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
-        const uint32_t* indices32 = reinterpret_cast<const uint32_t*>(srcData);
-        for (size_t i = 0; i < srcAccessor.count; ++i) {
-            srcIndices[i] = indices32[i];
-        }
-    } else if (srcAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-        const uint8_t* indices8 = srcData;
-        for (size_t i = 0; i < srcAccessor.count; ++i) {
-            srcIndices[i] = indices8[i];
-        }
-    }
-    
-    // Write remapped indices to destination
-    for (size_t i = 0; i < srcAccessor.count; ++i) {
-        uint32_t srcIndex = srcIndices[i];
-        uint32_t dstIndex = remap[srcIndex];
-        size_t writeOffset = dstOffset + i;
-        
-        if (dstAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-            uint16_t* dst16 = reinterpret_cast<uint16_t*>(dstData);
-            dst16[writeOffset] = static_cast<uint16_t>(dstIndex);
-        } else if (dstAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
-            uint32_t* dst32 = reinterpret_cast<uint32_t*>(dstData);
-            dst32[writeOffset] = dstIndex;
-        } else if (dstAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-            uint8_t* dst8 = dstData;
-            dst8[writeOffset] = static_cast<uint8_t>(dstIndex);
-        }
-    }
-}
+struct PrimitiveInfo {
+    const tinygltf::Primitive* primitive = nullptr;
+    size_t vertexBase = 0;
+    size_t vertexCount = 0;
+    size_t indexBase = 0;
+    size_t indexCount = 0;
+};
 
-int GltfJoin::joinPrimitives(const std::vector<int>& primIndices,
-                             tinygltf::Mesh& mesh,
-                             tinygltf::Model& model) {
-    if (primIndices.size() < 2) return -1;
-    
-    // Use first primitive as template
-    const auto& templatePrim = mesh.primitives[primIndices[0]];
-    
-    // Validate compatibility
-    for (size_t i = 1; i < primIndices.size(); ++i) {
-        if (!arePrimitivesCompatible(templatePrim, mesh.primitives[primIndices[i]], model)) {
-            std::cerr << "Primitives not compatible for joining" << std::endl;
-            return -1;
-        }
+struct JoinSummary {
+    size_t removedPrimitives = 0;
+    size_t mergedVertices = 0;
+    size_t mergedIndices = 0;
+};
+
+bool joinPrimitiveGroup(const std::vector<int>& group,
+                        tinygltf::Mesh& mesh,
+                        tinygltf::Model& model,
+                        JoinSummary& summary,
+                        std::string& error) {
+    if (group.size() < 2) {
+        return false;
     }
-    
-    // Build remap lists and count vertices
-    std::vector<std::vector<uint32_t>> primRemaps;
-    std::vector<uint32_t> primVertexCounts(primIndices.size(), 0);
-    
-    uint32_t dstVertexCount = 0;
-    uint32_t dstIndicesCount = 0;
-    
-    // Build remap for each primitive
-    for (size_t primIdx = 0; primIdx < primIndices.size(); ++primIdx) {
-        const auto& prim = mesh.primitives[primIndices[primIdx]];
-        
-        // Get position accessor to determine vertex count
-        int posAccessorIdx = -1;
+
+    const auto& templatePrim = mesh.primitives[group.front()];
+    if (!templatePrim.targets.empty()) {
+        return false;
+    }
+
+    std::vector<PrimitiveInfo> infos;
+    infos.reserve(group.size());
+
+    size_t totalVertices = 0;
+    size_t totalIndices = 0;
+
+    // Validate and collect counts
+    for (int primIndex : group) {
+        if (primIndex < 0 || primIndex >= static_cast<int>(mesh.primitives.size())) {
+            error = "Invalid primitive index";
+            return false;
+        }
+
+        const auto& prim = mesh.primitives[primIndex];
+        if (prim.targets.size() != templatePrim.targets.size()) {
+            error = "Primitive targets mismatch";
+            return false;
+        }
+
         auto posIt = prim.attributes.find("POSITION");
-        if (posIt != prim.attributes.end()) {
-            posAccessorIdx = posIt->second;
+        if (posIt == prim.attributes.end()) {
+            error = "Primitive missing POSITION attribute";
+            return false;
         }
-        
-        if (posAccessorIdx < 0) {
-            std::cerr << "Primitive missing POSITION attribute" << std::endl;
-            return -1;
+
+        ConstAccessorSpan positionSpan;
+        if (!resolveConstSpan(model, posIt->second, positionSpan)) {
+            error = "Invalid POSITION accessor";
+            return false;
         }
-        
-        const auto& posAccessor = model.accessors[posAccessorIdx];
-        uint32_t srcVertexCount = static_cast<uint32_t>(posAccessor.count);
-        
-        // Get indices if present
-        std::vector<uint32_t> srcIndices;
-        if (prim.indices >= 0) {
-            const auto& indicesAccessor = model.accessors[prim.indices];
-            const auto& indicesBV = model.bufferViews[indicesAccessor.bufferView];
-            const auto& indicesBuffer = model.buffers[indicesBV.buffer];
-            const uint8_t* indicesData = indicesBuffer.data.data() + indicesBV.byteOffset + indicesAccessor.byteOffset;
-            
-            srcIndices.resize(indicesAccessor.count);
-            
-            if (indicesAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-                const uint16_t* indices16 = reinterpret_cast<const uint16_t*>(indicesData);
-                for (size_t i = 0; i < indicesAccessor.count; ++i) {
-                    srcIndices[i] = indices16[i];
-                }
-            } else if (indicesAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
-                const uint32_t* indices32 = reinterpret_cast<const uint32_t*>(indicesData);
-                for (size_t i = 0; i < indicesAccessor.count; ++i) {
-                    srcIndices[i] = indices32[i];
-                }
-            } else if (indicesAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-                const uint8_t* indices8 = indicesData;
-                for (size_t i = 0; i < indicesAccessor.count; ++i) {
-                    srcIndices[i] = indices8[i];
-                }
+
+        PrimitiveInfo info;
+        info.primitive = &prim;
+        info.vertexBase = totalVertices;
+        info.vertexCount = positionSpan.count;
+        totalVertices += info.vertexCount;
+
+        const bool templateHasIndices = templatePrim.indices >= 0;
+        if (templateHasIndices) {
+            if (prim.indices < 0) {
+                error = "Primitive missing indices";
+                return false;
             }
-            
-            dstIndicesCount += static_cast<uint32_t>(indicesAccessor.count);
+            ConstAccessorSpan indexSpan;
+            if (!resolveConstSpan(model, prim.indices, indexSpan)) {
+                error = "Invalid index accessor";
+                return false;
+            }
+            info.indexBase = totalIndices;
+            info.indexCount = indexSpan.count;
+            totalIndices += info.indexCount;
         } else {
-            srcIndices.resize(srcVertexCount);
-            for (uint32_t i = 0; i < srcVertexCount; ++i) {
-                srcIndices[i] = i;
-            }
-            dstIndicesCount += srcVertexCount;
+            info.indexBase = totalIndices;
+            info.indexCount = info.vertexCount;
+            totalIndices += info.indexCount;
         }
-        
-        // Build remap
-        std::vector<uint32_t> remap(srcVertexCount, EMPTY_U32);
-        
-        for (uint32_t srcIndex : srcIndices) {
-            if (srcIndex >= srcVertexCount) continue;
-            
-            if (remap[srcIndex] == EMPTY_U32) {
-                remap[srcIndex] = dstVertexCount++;
-                primVertexCounts[primIdx]++;
-            }
-        }
-        
-        primRemaps.push_back(std::move(remap));
+
+        infos.push_back(info);
     }
-    
-    // Create destination primitive
-    tinygltf::Primitive dstPrim;
-    dstPrim.mode = templatePrim.mode;
-    dstPrim.material = templatePrim.material;
-    
-    // Allocate joined attributes
-    for (const auto& attrPair : templatePrim.attributes) {
-        const std::string& semantic = attrPair.first;
-        int tplAccessorIdx = attrPair.second;
-        const auto& tplAccessor = model.accessors[tplAccessorIdx];
-        
-        size_t elementSize = getElementSize(tplAccessor.type);
-        size_t componentSize = getComponentSize(tplAccessor.componentType);
-        size_t totalBytes = dstVertexCount * elementSize * componentSize;
-        
-        // Create buffer for this attribute
-        int bufferIdx = createBuffer(model, totalBytes);
-        int bufferViewIdx = createBufferView(model, bufferIdx, 0, totalBytes, TINYGLTF_TARGET_ARRAY_BUFFER);
-        int accessorIdx = createAccessor(model, bufferViewIdx, tplAccessor.componentType, 
-                                        dstVertexCount, tplAccessor.type);
-        
-        dstPrim.attributes[semantic] = accessorIdx;
+
+    if (totalVertices == 0) {
+        return false;
     }
-    
-    // Allocate joined indices
-    if (templatePrim.indices >= 0) {
-        const auto& tplIndicesAccessor = model.accessors[templatePrim.indices];
-        
-        // Determine appropriate component type for destination indices
-        int dstComponentType = tplIndicesAccessor.componentType;
-        if (dstVertexCount > 65535) {
-            dstComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
-        } else if (dstVertexCount > 255) {
-            dstComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
-        } else {
-            dstComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
+
+    // Validate attribute compatibility
+    for (const auto& attribute : templatePrim.attributes) {
+        const int templateAccessorIdx = attribute.second;
+        if (templateAccessorIdx < 0 || templateAccessorIdx >= static_cast<int>(model.accessors.size())) {
+            error = "Invalid template attribute accessor";
+            return false;
         }
-        
-        size_t componentSize = getComponentSize(dstComponentType);
-        size_t totalBytes = dstIndicesCount * componentSize;
-        
-        int bufferIdx = createBuffer(model, totalBytes);
-        int bufferViewIdx = createBufferView(model, bufferIdx, 0, totalBytes, TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER);
-        int indicesIdx = createAccessor(model, bufferViewIdx, dstComponentType, dstIndicesCount, TINYGLTF_TYPE_SCALAR);
-        
-        dstPrim.indices = indicesIdx;
+        const auto& templateAccessor = model.accessors[templateAccessorIdx];
+
+        for (const auto& info : infos) {
+            auto srcIt = info.primitive->attributes.find(attribute.first);
+            if (srcIt == info.primitive->attributes.end()) {
+                error = "Attribute mismatch across primitives";
+                return false;
+            }
+            const int srcAccessorIdx = srcIt->second;
+            if (srcAccessorIdx < 0 || srcAccessorIdx >= static_cast<int>(model.accessors.size())) {
+                error = "Invalid attribute accessor";
+                return false;
+            }
+            const auto& srcAccessor = model.accessors[srcAccessorIdx];
+            if (srcAccessor.type != templateAccessor.type ||
+                srcAccessor.componentType != templateAccessor.componentType) {
+                error = "Attribute type mismatch";
+                return false;
+            }
+            ConstAccessorSpan span;
+            if (!resolveConstSpan(model, srcAccessorIdx, span)) {
+                error = "Failed to access attribute data";
+                return false;
+            }
+        }
+    }
+
+    const size_t accessorStart = model.accessors.size();
+    const size_t viewStart = model.bufferViews.size();
+    const size_t bufferStart = model.buffers.size();
+
+    auto rollback = [&]() {
+        model.accessors.resize(accessorStart);
+        model.bufferViews.resize(viewStart);
+        model.buffers.resize(bufferStart);
+    };
+
+    tinygltf::Primitive joined;
+    joined.mode = templatePrim.mode;
+    joined.material = templatePrim.material;
+
+    // Allocate destination attributes
+    struct AttributeTarget {
+        std::string semantic;
+        int accessorIdx = -1;
+        AccessorSpan span;
+    };
+
+    std::vector<AttributeTarget> targets;
+    targets.reserve(templatePrim.attributes.size());
+
+    for (const auto& attribute : templatePrim.attributes) {
+        const int templateAccessorIdx = attribute.second;
+        const auto& templateAccessor = model.accessors[templateAccessorIdx];
+        const int accessorIdx = allocateAccessor(model,
+                                                 totalVertices,
+                                                 templateAccessor.type,
+                                                 templateAccessor.componentType,
+                                                 TINYGLTF_TARGET_ARRAY_BUFFER);
+
+        AccessorSpan span;
+        if (!resolveSpan(model, accessorIdx, span)) {
+            rollback();
+            error = "Failed to allocate attribute buffer";
+            return false;
+        }
+
+        joined.attributes[attribute.first] = accessorIdx;
+        targets.push_back({attribute.first, accessorIdx, span});
+    }
+
+    const bool templateHasIndices = templatePrim.indices >= 0;
+    int joinedIndicesAccessor = -1;
+    AccessorSpan joinedIndexSpan;
+    int joinedIndexComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
+
+    if (templateHasIndices) {
+        joinedIndexComponentType = chooseIndexComponentType(totalVertices);
+        joinedIndicesAccessor = allocateAccessor(model,
+                                                 totalIndices,
+                                                 TINYGLTF_TYPE_SCALAR,
+                                                 joinedIndexComponentType,
+                                                 TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER);
+        if (!resolveSpan(model, joinedIndicesAccessor, joinedIndexSpan)) {
+            rollback();
+            error = "Failed to allocate index buffer";
+            return false;
+        }
+        joined.indices = joinedIndicesAccessor;
     } else {
-        dstPrim.indices = -1;
+        joined.indices = -1;
     }
-    
-    // Remap attributes and indices into joined primitive
-    size_t dstIndicesOffset = 0;
-    
-    for (size_t primIdx = 0; primIdx < primIndices.size(); ++primIdx) {
-        const auto& srcPrim = mesh.primitives[primIndices[primIdx]];
-        const auto& remap = primRemaps[primIdx];
-        
-        // Remap indices if present
-        if (srcPrim.indices >= 0 && dstPrim.indices >= 0) {
-            remapIndices(srcPrim.indices, remap, dstPrim.indices, dstIndicesOffset, model);
-            
-            const auto& srcIndicesAccessor = model.accessors[srcPrim.indices];
-            dstIndicesOffset += srcIndicesAccessor.count;
-        }
-        
-        // Remap all attributes
-        for (const auto& attrPair : dstPrim.attributes) {
-            const std::string& semantic = attrPair.first;
-            int dstAccessorIdx = attrPair.second;
-            
-            auto srcIt = srcPrim.attributes.find(semantic);
-            if (srcIt == srcPrim.attributes.end()) continue;
-            
-            int srcAccessorIdx = srcIt->second;
-            remapAttribute(srcAccessorIdx, srcPrim.indices, remap, dstAccessorIdx, model);
+
+    // Copy vertex attributes
+    for (const auto& info : infos) {
+        for (auto& target : targets) {
+            auto srcIt = info.primitive->attributes.find(target.semantic);
+            const int srcAccessorIdx = srcIt->second;
+            ConstAccessorSpan srcSpan;
+            if (!resolveConstSpan(model, srcAccessorIdx, srcSpan)) {
+                rollback();
+                error = "Failed to read attribute data";
+                return false;
+            }
+
+            for (size_t i = 0; i < info.vertexCount; ++i) {
+                const uint8_t* src = srcSpan.data + i * srcSpan.stride;
+                uint8_t* dst = target.span.data + (info.vertexBase + i) * target.span.stride;
+                std::memcpy(dst, src, srcSpan.elementSize);
+            }
         }
     }
-    
-    // Add the joined primitive to the mesh
-    mesh.primitives.push_back(dstPrim);
-    return static_cast<int>(mesh.primitives.size() - 1);
+
+    // Copy indices (or generate sequential if original primitives were non-indexed)
+    if (templateHasIndices) {
+        for (const auto& info : infos) {
+            std::vector<uint32_t> indices;
+            if (!readIndices(model, info.primitive->indices, indices)) {
+                rollback();
+                error = "Failed to read index data";
+                return false;
+            }
+
+            for (size_t i = 0; i < indices.size(); ++i) {
+                const uint32_t value = indices[i] + static_cast<uint32_t>(info.vertexBase);
+                writeIndexValue(joinedIndexSpan, info.indexBase + i, value, joinedIndexComponentType);
+            }
+        }
+    }
+
+    mesh.primitives.push_back(joined);
+
+    summary.removedPrimitives = group.size();
+    summary.mergedVertices = totalVertices;
+    summary.mergedIndices = templateHasIndices ? totalIndices : 0;
+    return true;
 }
+
+} // namespace
+
+GltfJoin::GltfJoin() = default;
+GltfJoin::~GltfJoin() = default;
 
 bool GltfJoin::process(tinygltf::Model& model, const JoinOptions& options) {
-    int primitivesJoined = 0;
-    int meshesProcessed = 0;
-    
-    // Process each mesh
+    error_.clear();
+    stats_.clear();
+
+    size_t meshesModified = 0;
+    size_t groupsMerged = 0;
+    size_t primitivesRemoved = 0;
+
     for (auto& mesh : model.meshes) {
-        if (mesh.primitives.size() < 2) continue;
-        
-        // Group primitives by compatibility key
-        std::unordered_map<std::string, std::vector<int>> groups;
-        
-        for (size_t i = 0; i < mesh.primitives.size(); ++i) {
-            const auto& prim = mesh.primitives[i];
-            
-            // Skip primitives with morph targets (not supported yet)
-            if (!prim.targets.empty()) {
+        if (mesh.primitives.size() < 2) {
+            continue;
+        }
+
+        std::unordered_map<std::string, std::vector<int>> buckets;
+        buckets.reserve(mesh.primitives.size());
+
+        for (size_t primIdx = 0; primIdx < mesh.primitives.size(); ++primIdx) {
+            const auto& primitive = mesh.primitives[primIdx];
+            if (!primitive.targets.empty()) {
                 if (options.verbose) {
-                    std::cout << "  Skipping primitive with morph targets" << std::endl;
+                    std::cout << "[join] Skipping primitive with morph targets in mesh '"
+                              << mesh.name << "'" << std::endl;
                 }
                 continue;
             }
-            
-            std::string key = createPrimGroupKey(prim, model);
-            
-            // If keepNamed is enabled, add mesh name to key
+
+            std::string key = primitiveKey(primitive, model);
             if (options.keepNamed && !mesh.name.empty()) {
-                key += "|mesh:" + mesh.name;
+                key.append("|mesh:").append(mesh.name);
             }
-            
-            groups[key].push_back(static_cast<int>(i));
+
+            buckets[key].push_back(static_cast<int>(primIdx));
         }
-        
-        // Find groups with 2+ primitives
-        std::vector<std::vector<int>> joinGroups;
-        for (const auto& pair : groups) {
-            if (pair.second.size() >= 2) {
-                joinGroups.push_back(pair.second);
+
+        std::vector<int> removal;
+        removal.reserve(mesh.primitives.size());
+        bool modified = false;
+
+        for (const auto& entry : buckets) {
+            const auto& group = entry.second;
+            if (group.size() < 2) {
+                continue;
             }
-        }
-        
-        if (joinGroups.empty()) continue;
-        
-        // Join each group
-        std::unordered_set<int> primsToRemove;
-        
-        for (const auto& group : joinGroups) {
+
             if (options.verbose) {
-                std::cout << "  Joining " << group.size() << " primitives in mesh '" 
-                         << mesh.name << "'" << std::endl;
+                std::cout << "[join] Joining " << group.size() << " primitives in mesh '"
+                          << mesh.name << "'" << std::endl;
             }
-            
-            int joinedIdx = joinPrimitives(group, mesh, model);
-            
-            if (joinedIdx >= 0) {
-                // Mark original primitives for removal
-                for (int idx : group) {
-                    primsToRemove.insert(idx);
+
+            JoinSummary summary;
+            std::string error;
+            const size_t accessorStart = model.accessors.size();
+            const size_t viewStart = model.bufferViews.size();
+            const size_t bufferStart = model.buffers.size();
+            const size_t primitiveStart = mesh.primitives.size();
+
+            if (!joinPrimitiveGroup(group, mesh, model, summary, error)) {
+                model.accessors.resize(accessorStart);
+                model.bufferViews.resize(viewStart);
+                model.buffers.resize(bufferStart);
+                mesh.primitives.resize(primitiveStart);
+
+                if (!error.empty()) {
+                    error_ = error;
+                    return false;
                 }
-                primitivesJoined += static_cast<int>(group.size());
+                continue;
             }
+
+            removal.insert(removal.end(), group.begin(), group.end());
+            primitivesRemoved += summary.removedPrimitives;
+            groupsMerged++;
+            modified = true;
         }
-        
-        // Remove joined primitives (iterate backwards to maintain indices)
-        if (!primsToRemove.empty()) {
-            std::vector<tinygltf::Primitive> newPrimitives;
-            for (size_t i = 0; i < mesh.primitives.size(); ++i) {
-                if (primsToRemove.find(static_cast<int>(i)) == primsToRemove.end()) {
-                    newPrimitives.push_back(mesh.primitives[i]);
+
+        if (modified) {
+            std::sort(removal.begin(), removal.end());
+            removal.erase(std::unique(removal.begin(), removal.end()), removal.end());
+
+            for (auto it = removal.rbegin(); it != removal.rend(); ++it) {
+                if (*it >= 0 && *it < static_cast<int>(mesh.primitives.size())) {
+                    mesh.primitives.erase(mesh.primitives.begin() + *it);
                 }
             }
-            mesh.primitives = std::move(newPrimitives);
-            meshesProcessed++;
+
+            ++meshesModified;
         }
     }
-    
+
+    if (groupsMerged > 0) {
+        std::ostringstream stream;
+        stream << "Meshes modified: " << meshesModified << '\n'
+               << "Groups merged: " << groupsMerged << '\n'
+               << "Primitives removed: " << primitivesRemoved;
+        stats_ = stream.str();
+    } else {
+        stats_ = "No compatible primitives found";
+    }
+
     if (options.verbose) {
-        std::cout << "Join complete: processed " << meshesProcessed << " meshes, "
-                 << "joined " << primitivesJoined << " primitives" << std::endl;
+        std::cout << "[join] " << stats_ << std::endl;
     }
-    
+
     return true;
 }
 
