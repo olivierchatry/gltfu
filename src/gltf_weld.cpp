@@ -1,19 +1,17 @@
 #include "gltf_weld.h"
-#include <iostream>
-#include <cstring>
+
 #include <algorithm>
-#include <unordered_set>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <vector>
 
 namespace gltfu {
-
 namespace {
-    const uint32_t EMPTY_U32 = 0xFFFFFFFF;
-}
 
-GltfWeld::GltfWeld() = default;
-GltfWeld::~GltfWeld() = default;
+constexpr uint32_t kEmpty = 0xffffffffu;
 
-size_t GltfWeld::getElementSize(int type) const {
+size_t elementWidth(int type) {
     switch (type) {
         case TINYGLTF_TYPE_SCALAR: return 1;
         case TINYGLTF_TYPE_VEC2: return 2;
@@ -26,7 +24,7 @@ size_t GltfWeld::getElementSize(int type) const {
     }
 }
 
-size_t GltfWeld::getComponentSize(int componentType) const {
+size_t componentSize(int componentType) {
     switch (componentType) {
         case TINYGLTF_COMPONENT_TYPE_BYTE:
         case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
@@ -43,37 +41,11 @@ size_t GltfWeld::getComponentSize(int componentType) const {
     }
 }
 
-const uint8_t* GltfWeld::getAccessorData(int accessorIdx, const tinygltf::Model& model) const {
-    if (accessorIdx < 0 || accessorIdx >= static_cast<int>(model.accessors.size())) {
-        return nullptr;
+uint32_t ceilPowerOfTwo(uint32_t n) {
+    if (n <= 1) {
+        return 1;
     }
-    
-    const auto& accessor = model.accessors[accessorIdx];
-    const auto& bufferView = model.bufferViews[accessor.bufferView];
-    const auto& buffer = model.buffers[bufferView.buffer];
-    
-    return buffer.data.data() + bufferView.byteOffset + accessor.byteOffset;
-}
 
-uint32_t GltfWeld::murmurHash2(uint32_t h, const uint32_t* key, size_t len) {
-    const uint32_t m = 0x5bd1e995;
-    const uint32_t r = 24;
-    
-    for (size_t i = 0; i < len; ++i) {
-        uint32_t k = key[i];
-        k = (k * m) & 0xFFFFFFFF;
-        k = (k ^ (k >> r)) & 0xFFFFFFFF;
-        k = (k * m) & 0xFFFFFFFF;
-        
-        h = (h * m) & 0xFFFFFFFF;
-        h = (h ^ k) & 0xFFFFFFFF;
-    }
-    
-    return h;
-}
-
-uint32_t GltfWeld::ceilPowerOfTwo(uint32_t n) {
-    if (n <= 1) return 1;
     n--;
     n |= n >> 1;
     n |= n >> 2;
@@ -83,467 +55,424 @@ uint32_t GltfWeld::ceilPowerOfTwo(uint32_t n) {
     return n + 1;
 }
 
-uint32_t GltfWeld::hashLookup(const std::vector<uint32_t>& table,
-                              uint32_t buckets,
-                              const VertexStream& stream,
-                              uint32_t key,
-                              uint32_t empty) {
-    uint32_t hashmod = buckets - 1;
-    uint32_t hashval = stream.hash(key);
-    uint32_t bucket = hashval & hashmod;
-    
-    for (uint32_t probe = 0; probe <= hashmod; ++probe) {
-        uint32_t item = table[bucket];
-        
-        if (item == empty || stream.equal(item, key)) {
-            return bucket;
-        }
-        
-        bucket = (bucket + probe + 1) & hashmod; // Hash collision
+const uint8_t* accessorData(const tinygltf::Model& model, int accessorIdx) {
+    if (accessorIdx < 0 || accessorIdx >= static_cast<int>(model.accessors.size())) {
+        return nullptr;
     }
-    
-    // Table full (shouldn't happen with proper sizing)
-    return 0;
+
+    const auto& accessor = model.accessors[accessorIdx];
+    if (accessor.bufferView < 0 || accessor.bufferView >= static_cast<int>(model.bufferViews.size())) {
+        return nullptr;
+    }
+
+    const auto& bufferView = model.bufferViews[accessor.bufferView];
+    if (bufferView.buffer < 0 || bufferView.buffer >= static_cast<int>(model.buffers.size())) {
+        return nullptr;
+    }
+
+    const auto& buffer = model.buffers[bufferView.buffer];
+    size_t offset = bufferView.byteOffset + accessor.byteOffset;
+    if (offset >= buffer.data.size()) {
+        return nullptr;
+    }
+
+    return buffer.data.data() + offset;
 }
 
-// VertexStream implementation
-GltfWeld::VertexStream::VertexStream(const tinygltf::Primitive& prim, const tinygltf::Model& model) {
-    // Collect all attributes
-    for (const auto& attrPair : prim.attributes) {
-        int accessorIdx = attrPair.second;
-        if (accessorIdx < 0 || accessorIdx >= static_cast<int>(model.accessors.size())) {
-            continue;
-        }
-        
-        const auto& accessor = model.accessors[accessorIdx];
+size_t vertexStride(const tinygltf::Accessor& accessor, const tinygltf::Model& model) {
+    if (accessor.bufferView >= 0 && accessor.bufferView < static_cast<int>(model.bufferViews.size())) {
         const auto& bufferView = model.bufferViews[accessor.bufferView];
-        const auto& buffer = model.buffers[bufferView.buffer];
-        
-        AttributeView view;
-        view.data = buffer.data.data() + bufferView.byteOffset + accessor.byteOffset;
-        
-        size_t elementSize = 1;
-        switch (accessor.type) {
-            case TINYGLTF_TYPE_SCALAR: elementSize = 1; break;
-            case TINYGLTF_TYPE_VEC2: elementSize = 2; break;
-            case TINYGLTF_TYPE_VEC3: elementSize = 3; break;
-            case TINYGLTF_TYPE_VEC4: elementSize = 4; break;
-            case TINYGLTF_TYPE_MAT2: elementSize = 4; break;
-            case TINYGLTF_TYPE_MAT3: elementSize = 9; break;
-            case TINYGLTF_TYPE_MAT4: elementSize = 16; break;
+        if (bufferView.byteStride > 0) {
+            return bufferView.byteStride;
         }
-        
-        size_t componentSize = 1;
-        switch (accessor.componentType) {
-            case TINYGLTF_COMPONENT_TYPE_BYTE:
-            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
-                componentSize = 1; break;
-            case TINYGLTF_COMPONENT_TYPE_SHORT:
-            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
-                componentSize = 2; break;
-            case TINYGLTF_COMPONENT_TYPE_INT:
-            case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
-            case TINYGLTF_COMPONENT_TYPE_FLOAT:
-                componentSize = 4; break;
-        }
-        
-        view.byteStride = elementSize * componentSize;
-        
-        attributes.push_back(view);
     }
+
+    return elementWidth(accessor.type) * componentSize(accessor.componentType);
 }
 
-uint32_t GltfWeld::VertexStream::hash(uint32_t index) const {
-    // Compute hash directly from attribute data without copying
-    uint32_t h = 0;
-    const uint32_t m = 0x5bd1e995;
-    const uint32_t r = 24;
-    
-    for (const auto& attr : attributes) {
-        const uint8_t* src = attr.data + index * attr.byteStride;
-        const uint32_t* src32 = reinterpret_cast<const uint32_t*>(src);
-        size_t numFullWords = attr.byteStride / 4;
-        
-        // Hash full 32-bit words
-        for (size_t i = 0; i < numFullWords; ++i) {
-            uint32_t k = src32[i];
-            k = (k * m) & 0xFFFFFFFF;
-            k = (k ^ (k >> r)) & 0xFFFFFFFF;
-            k = (k * m) & 0xFFFFFFFF;
-            h = (h * m) & 0xFFFFFFFF;
-            h = (h ^ k) & 0xFFFFFFFF;
+struct AttributeView {
+    const uint8_t* base = nullptr;
+    size_t stride = 0;
+};
+
+class VertexStream {
+public:
+    VertexStream(const tinygltf::Primitive& primitive, const tinygltf::Model& model) {
+        attributes.reserve(primitive.attributes.size());
+        for (const auto& attribute : primitive.attributes) {
+            const int accessorIdx = attribute.second;
+            const uint8_t* data = accessorData(model, accessorIdx);
+            if (!data) {
+                continue;
+            }
+
+            const auto& accessor = model.accessors[accessorIdx];
+            AttributeView view{};
+            view.base = data;
+            view.stride = vertexStride(accessor, model);
+            attributes.push_back(view);
         }
-        
-        // Handle remaining bytes
-        size_t remainingBytes = attr.byteStride % 4;
-        if (remainingBytes > 0) {
+    }
+
+    uint32_t hash(uint32_t index) const {
+        uint32_t h = 0;
+        constexpr uint32_t m = 0x5bd1e995;
+        constexpr uint32_t r = 24;
+
+        for (const auto& attr : attributes) {
+            const uint8_t* src = attr.base + index * attr.stride;
+            const auto* words = reinterpret_cast<const uint32_t*>(src);
+            const size_t wordCount = attr.stride / 4;
+
+            for (size_t i = 0; i < wordCount; ++i) {
+                uint32_t k = words[i];
+                k = (k * m) & 0xffffffffu;
+                k = (k ^ (k >> r)) & 0xffffffffu;
+                k = (k * m) & 0xffffffffu;
+                h = (h * m) & 0xffffffffu;
+                h = (h ^ k) & 0xffffffffu;
+            }
+
+            const size_t remaining = attr.stride % 4;
+            if (remaining == 0) {
+                continue;
+            }
+
             uint32_t k = 0;
-            size_t offset = numFullWords * 4;
-            for (size_t i = 0; i < remainingBytes; ++i) {
+            const size_t offset = wordCount * 4;
+            for (size_t i = 0; i < remaining; ++i) {
                 k |= static_cast<uint32_t>(src[offset + i]) << (i * 8);
             }
-            k = (k * m) & 0xFFFFFFFF;
-            k = (k ^ (k >> r)) & 0xFFFFFFFF;
-            k = (k * m) & 0xFFFFFFFF;
-            h = (h * m) & 0xFFFFFFFF;
-            h = (h ^ k) & 0xFFFFFFFF;
-        }
-    }
-    
-    return h;
-}
 
-bool GltfWeld::VertexStream::equal(uint32_t a, uint32_t b) const {
-    if (a == b) return true;
-    
-    for (const auto& attr : attributes) {
-        const uint8_t* dataA = attr.data + a * attr.byteStride;
-        const uint8_t* dataB = attr.data + b * attr.byteStride;
-        
-        // Fast comparison using 64-bit words when possible
-        size_t numWords = attr.byteStride / 8;
-        const uint64_t* ptrA64 = reinterpret_cast<const uint64_t*>(dataA);
-        const uint64_t* ptrB64 = reinterpret_cast<const uint64_t*>(dataB);
-        
-        for (size_t i = 0; i < numWords; ++i) {
-            if (ptrA64[i] != ptrB64[i]) return false;
+            k = (k * m) & 0xffffffffu;
+            k = (k ^ (k >> r)) & 0xffffffffu;
+            k = (k * m) & 0xffffffffu;
+            h = (h * m) & 0xffffffffu;
+            h = (h ^ k) & 0xffffffffu;
         }
-        
-        // Compare remaining bytes
-        size_t remaining = attr.byteStride % 8;
-        if (remaining > 0) {
-            size_t offset = numWords * 8;
-            if (std::memcmp(dataA + offset, dataB + offset, remaining) != 0) {
+
+        return h;
+    }
+
+    bool equal(uint32_t a, uint32_t b) const {
+        if (a == b) {
+            return true;
+        }
+
+        for (const auto& attr : attributes) {
+            const uint8_t* lhs = attr.base + a * attr.stride;
+            const uint8_t* rhs = attr.base + b * attr.stride;
+
+            const size_t wordCount = attr.stride / 8;
+            const auto* lhsWords = reinterpret_cast<const uint64_t*>(lhs);
+            const auto* rhsWords = reinterpret_cast<const uint64_t*>(rhs);
+            for (size_t i = 0; i < wordCount; ++i) {
+                if (lhsWords[i] != rhsWords[i]) {
+                    return false;
+                }
+            }
+
+            const size_t remaining = attr.stride % 8;
+            if (remaining == 0) {
+                continue;
+            }
+
+            const size_t offset = wordCount * 8;
+            if (std::memcmp(lhs + offset, rhs + offset, remaining) != 0) {
                 return false;
             }
         }
+
+        return true;
     }
-    return true;
+
+private:
+    std::vector<AttributeView> attributes;
+};
+
+uint32_t findSlot(const std::vector<uint32_t>& table,
+                  uint32_t bucketCount,
+                  const VertexStream& stream,
+                  uint32_t key) {
+    const uint32_t mask = bucketCount - 1;
+    uint32_t bucket = stream.hash(key) & mask;
+
+    for (uint32_t probe = 0; probe <= mask; ++probe) {
+        const uint32_t value = table[bucket];
+        if (value == kEmpty || stream.equal(value, key)) {
+            return bucket;
+        }
+        bucket = (bucket + probe + 1) & mask;
+    }
+
+    return bucket;
 }
 
-bool GltfWeld::compactPrimitive(tinygltf::Primitive& primitive,
-                                tinygltf::Mesh& /* mesh */,
-                                tinygltf::Model& model,
-                                const std::vector<uint32_t>& remap,
-                                uint32_t dstVertexCount) {
-    // Create new indices
-    int srcIndicesIdx = primitive.indices;
-    size_t srcIndicesCount;
-    
-    if (srcIndicesIdx >= 0) {
-        const auto& srcIndices = model.accessors[srcIndicesIdx];
-        srcIndicesCount = srcIndices.count;
-    } else {
-        // If no indices, we need to create them
-        int posAccessorIdx = -1;
-        auto it = primitive.attributes.find("POSITION");
-        if (it != primitive.attributes.end()) {
-            posAccessorIdx = it->second;
+std::vector<uint32_t> readIndices(const tinygltf::Primitive& primitive,
+                                  const tinygltf::Model& model,
+                                  uint32_t vertexCount) {
+    if (primitive.indices < 0) {
+        std::vector<uint32_t> indices(vertexCount);
+        for (uint32_t i = 0; i < vertexCount; ++i) {
+            indices[i] = i;
         }
-        if (posAccessorIdx < 0) return false;
-        
-        const auto& posAccessor = model.accessors[posAccessorIdx];
-        srcIndicesCount = posAccessor.count;
+        return indices;
     }
-    
-    // Determine component type for new indices
+
+    std::vector<uint32_t> indices;
+    const auto& accessor = model.accessors[primitive.indices];
+    const uint8_t* data = accessorData(model, primitive.indices);
+    if (!data) {
+        return indices;
+    }
+
+    indices.resize(accessor.count);
+    switch (accessor.componentType) {
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE: {
+            const auto* src = reinterpret_cast<const uint8_t*>(data);
+            for (size_t i = 0; i < accessor.count; ++i) {
+                indices[i] = src[i];
+            }
+            break;
+        }
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+            const auto* src = reinterpret_cast<const uint16_t*>(data);
+            for (size_t i = 0; i < accessor.count; ++i) {
+                indices[i] = src[i];
+            }
+            break;
+        }
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT: {
+            const auto* src = reinterpret_cast<const uint32_t*>(data);
+            for (size_t i = 0; i < accessor.count; ++i) {
+                indices[i] = src[i];
+            }
+            break;
+        }
+        default:
+            indices.clear();
+            break;
+    }
+
+    return indices;
+}
+
+bool compactPrimitive(tinygltf::Primitive& primitive,
+                      tinygltf::Model& model,
+                      const std::vector<uint32_t>& srcIndices,
+                      const std::vector<uint32_t>& remap,
+                      uint32_t dstVertexCount) {
+    if (srcIndices.empty()) {
+        return true;
+    }
+
+    const size_t indexCount = srcIndices.size();
+
     int dstComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;
     if (dstVertexCount <= 255) {
         dstComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;
     } else if (dstVertexCount <= 65535) {
         dstComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT;
     }
-    
-    size_t dstComponentSize = getComponentSize(dstComponentType);
-    size_t dstIndicesBytes = srcIndicesCount * dstComponentSize;
-    
-    // Create new buffer for indices
-    tinygltf::Buffer indicesBuffer;
-    indicesBuffer.data.resize(dstIndicesBytes);
-    
-    // Write remapped indices
-    const uint8_t* srcData = nullptr;
-    std::vector<uint32_t> srcIndicesArray;
-    
-    if (srcIndicesIdx >= 0) {
-        const auto& srcAccessor = model.accessors[srcIndicesIdx];
-        const auto& srcBV = model.bufferViews[srcAccessor.bufferView];
-        const auto& srcBuffer = model.buffers[srcBV.buffer];
-        srcData = srcBuffer.data.data() + srcBV.byteOffset + srcAccessor.byteOffset;
-        
-        srcIndicesArray.resize(srcIndicesCount);
-        if (srcAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-            const uint16_t* src16 = reinterpret_cast<const uint16_t*>(srcData);
-            for (size_t i = 0; i < srcIndicesCount; ++i) {
-                srcIndicesArray[i] = src16[i];
+
+    const size_t componentBytes = componentSize(dstComponentType);
+    tinygltf::Buffer indexBuffer;
+    indexBuffer.data.resize(indexCount * componentBytes);
+
+    switch (dstComponentType) {
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE: {
+            auto* dst = reinterpret_cast<uint8_t*>(indexBuffer.data.data());
+            for (size_t i = 0; i < indexCount; ++i) {
+                dst[i] = static_cast<uint8_t>(remap[srcIndices[i]]);
             }
-        } else if (srcAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
-            const uint32_t* src32 = reinterpret_cast<const uint32_t*>(srcData);
-            for (size_t i = 0; i < srcIndicesCount; ++i) {
-                srcIndicesArray[i] = src32[i];
-            }
-        } else if (srcAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-            const uint8_t* src8 = srcData;
-            for (size_t i = 0; i < srcIndicesCount; ++i) {
-                srcIndicesArray[i] = src8[i];
-            }
+            break;
         }
-    } else {
-        srcIndicesArray.resize(srcIndicesCount);
-        for (size_t i = 0; i < srcIndicesCount; ++i) {
-            srcIndicesArray[i] = static_cast<uint32_t>(i);
+        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+            auto* dst = reinterpret_cast<uint16_t*>(indexBuffer.data.data());
+            for (size_t i = 0; i < indexCount; ++i) {
+                dst[i] = static_cast<uint16_t>(remap[srcIndices[i]]);
+            }
+            break;
+        }
+        default: {
+            auto* dst = reinterpret_cast<uint32_t*>(indexBuffer.data.data());
+            for (size_t i = 0; i < indexCount; ++i) {
+                dst[i] = remap[srcIndices[i]];
+            }
+            break;
         }
     }
-    
-    // Write remapped indices to new buffer
-    for (size_t i = 0; i < srcIndicesCount; ++i) {
-        uint32_t newIdx = remap[srcIndicesArray[i]];
-        
-        if (dstComponentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-            uint16_t* dst = reinterpret_cast<uint16_t*>(indicesBuffer.data.data());
-            dst[i] = static_cast<uint16_t>(newIdx);
-        } else if (dstComponentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
-            uint32_t* dst = reinterpret_cast<uint32_t*>(indicesBuffer.data.data());
-            dst[i] = newIdx;
-        } else if (dstComponentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-            uint8_t* dst = indicesBuffer.data.data();
-            dst[i] = static_cast<uint8_t>(newIdx);
+
+    const int indexBufferIdx = static_cast<int>(model.buffers.size());
+    model.buffers.push_back(indexBuffer);
+
+    tinygltf::BufferView indexView;
+    indexView.buffer = indexBufferIdx;
+    indexView.byteOffset = 0;
+    indexView.byteLength = indexBuffer.data.size();
+    indexView.target = TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER;
+    const int indexViewIdx = static_cast<int>(model.bufferViews.size());
+    model.bufferViews.push_back(indexView);
+
+    tinygltf::Accessor indexAccessor;
+    indexAccessor.bufferView = indexViewIdx;
+    indexAccessor.byteOffset = 0;
+    indexAccessor.componentType = dstComponentType;
+    indexAccessor.count = indexCount;
+    indexAccessor.type = TINYGLTF_TYPE_SCALAR;
+    const int indexAccessorIdx = static_cast<int>(model.accessors.size());
+    model.accessors.push_back(indexAccessor);
+
+    primitive.indices = indexAccessorIdx;
+
+    for (auto& entry : primitive.attributes) {
+        const int accessorIdx = entry.second;
+        if (accessorIdx < 0 || accessorIdx >= static_cast<int>(model.accessors.size())) {
+            continue;
         }
+
+        const auto srcAccessor = model.accessors[accessorIdx];
+        const size_t stride = vertexStride(srcAccessor, model);
+        const uint8_t* srcData = accessorData(model, accessorIdx);
+        if (!srcData || stride == 0) {
+            continue;
+        }
+
+        tinygltf::Buffer attributeBuffer;
+        attributeBuffer.data.resize(static_cast<size_t>(dstVertexCount) * stride);
+
+        std::vector<char> written(dstVertexCount, 0);
+        for (size_t i = 0; i < indexCount; ++i) {
+            const uint32_t srcIdx = srcIndices[i];
+            const uint32_t dstIdx = remap[srcIdx];
+            if (written[dstIdx]) {
+                continue;
+            }
+
+            const uint8_t* src = srcData + static_cast<size_t>(srcIdx) * stride;
+            uint8_t* dst = attributeBuffer.data.data() + static_cast<size_t>(dstIdx) * stride;
+            std::memcpy(dst, src, stride);
+            written[dstIdx] = 1;
+        }
+
+        const int bufferIdx = static_cast<int>(model.buffers.size());
+        model.buffers.push_back(attributeBuffer);
+
+        tinygltf::BufferView view;
+        view.buffer = bufferIdx;
+        view.byteOffset = 0;
+        view.byteLength = model.buffers[bufferIdx].data.size();
+        view.target = TINYGLTF_TARGET_ARRAY_BUFFER;
+        const int viewIdx = static_cast<int>(model.bufferViews.size());
+        model.bufferViews.push_back(view);
+
+        tinygltf::Accessor accessor;
+        accessor.bufferView = viewIdx;
+        accessor.byteOffset = 0;
+        accessor.componentType = srcAccessor.componentType;
+        accessor.count = dstVertexCount;
+        accessor.type = srcAccessor.type;
+        accessor.normalized = srcAccessor.normalized;
+        accessor.minValues = srcAccessor.minValues;
+        accessor.maxValues = srcAccessor.maxValues;
+
+        const int newAccessorIdx = static_cast<int>(model.accessors.size());
+        model.accessors.push_back(accessor);
+        entry.second = newAccessorIdx;
     }
-    
-    // Add indices buffer and create buffer view + accessor
-    int indicesBufferIdx = static_cast<int>(model.buffers.size());
-    model.buffers.push_back(indicesBuffer);
-    
-    tinygltf::BufferView indicesBV;
-    indicesBV.buffer = indicesBufferIdx;
-    indicesBV.byteOffset = 0;
-    indicesBV.byteLength = dstIndicesBytes;
-    indicesBV.target = TINYGLTF_TARGET_ELEMENT_ARRAY_BUFFER;
-    int indicesBVIdx = static_cast<int>(model.bufferViews.size());
-    model.bufferViews.push_back(indicesBV);
-    
-    tinygltf::Accessor indicesAccessor;
-    indicesAccessor.bufferView = indicesBVIdx;
-    indicesAccessor.byteOffset = 0;
-    indicesAccessor.componentType = dstComponentType;
-    indicesAccessor.count = srcIndicesCount;
-    indicesAccessor.type = TINYGLTF_TYPE_SCALAR;
-    int indicesAccessorIdx = static_cast<int>(model.accessors.size());
-    model.accessors.push_back(indicesAccessor);
-    
-    primitive.indices = indicesAccessorIdx;
-    
-    // Compact attributes
-    for (auto& attrPair : primitive.attributes) {
-        int srcAccessorIdx = attrPair.second;
-        const auto& srcAccessor = model.accessors[srcAccessorIdx];
-        
-        size_t elementSize = getElementSize(srcAccessor.type);
-        size_t componentSize = getComponentSize(srcAccessor.componentType);
-        size_t vertexStride = elementSize * componentSize;
-        
-        // Create new buffer for compacted attribute
-        tinygltf::Buffer attrBuffer;
-        attrBuffer.data.resize(dstVertexCount * vertexStride);
-        
-        const uint8_t* srcAttrData = getAccessorData(srcAccessorIdx, model);
-        if (!srcAttrData) continue;
-        
-        // Copy vertices according to remap, avoiding duplicates
-        std::vector<bool> written(dstVertexCount, false);
-        
-        for (size_t i = 0; i < srcIndicesCount; ++i) {
-            uint32_t srcIdx = srcIndicesArray[i];
-            uint32_t dstIdx = remap[srcIdx];
-            
-            if (written[dstIdx]) continue;
-            
-            const uint8_t* src = srcAttrData + srcIdx * vertexStride;
-            uint8_t* dst = attrBuffer.data.data() + dstIdx * vertexStride;
-            std::memcpy(dst, src, vertexStride);
-            
-            written[dstIdx] = true;
-        }
-        
-        // Add buffer, buffer view, and accessor
-        int attrBufferIdx = static_cast<int>(model.buffers.size());
-        model.buffers.push_back(attrBuffer);
-        
-        tinygltf::BufferView attrBV;
-        attrBV.buffer = attrBufferIdx;
-        attrBV.byteOffset = 0;
-        attrBV.byteLength = attrBuffer.data.size();
-        attrBV.target = TINYGLTF_TARGET_ARRAY_BUFFER;
-        int attrBVIdx = static_cast<int>(model.bufferViews.size());
-        model.bufferViews.push_back(attrBV);
-        
-        tinygltf::Accessor attrAccessor;
-        attrAccessor.bufferView = attrBVIdx;
-        attrAccessor.byteOffset = 0;
-        attrAccessor.componentType = srcAccessor.componentType;
-        attrAccessor.count = dstVertexCount;
-        attrAccessor.type = srcAccessor.type;
-        attrAccessor.normalized = srcAccessor.normalized;
-        
-        if (!srcAccessor.minValues.empty()) {
-            attrAccessor.minValues = srcAccessor.minValues;
-        }
-        if (!srcAccessor.maxValues.empty()) {
-            attrAccessor.maxValues = srcAccessor.maxValues;
-        }
-        
-        int attrAccessorIdx = static_cast<int>(model.accessors.size());
-        model.accessors.push_back(attrAccessor);
-        
-        attrPair.second = attrAccessorIdx;
-    }
-    
+
     return true;
 }
 
-bool GltfWeld::weldPrimitive(tinygltf::Primitive& primitive,
-                             tinygltf::Mesh& mesh,
-                             tinygltf::Model& model,
-                             const WeldOptions& options) {
-    // Skip if already indexed and overwrite is false
+bool weldPrimitive(tinygltf::Primitive& primitive,
+                   tinygltf::Model& model,
+                   const WeldOptions& options) {
     if (primitive.indices >= 0 && !options.overwrite) {
         return true;
     }
-    
-    // Skip POINTS mode
+
     if (primitive.mode == TINYGLTF_MODE_POINTS) {
         return true;
     }
-    
-    // Get position accessor to determine vertex count
-    int posAccessorIdx = -1;
-    auto it = primitive.attributes.find("POSITION");
-    if (it != primitive.attributes.end()) {
-        posAccessorIdx = it->second;
-    }
-    
-    if (posAccessorIdx < 0) {
+
+    const auto positionIt = primitive.attributes.find("POSITION");
+    if (positionIt == primitive.attributes.end()) {
         std::cerr << "Primitive missing POSITION attribute" << std::endl;
         return false;
     }
-    
-    const auto& posAccessor = model.accessors[posAccessorIdx];
-    uint32_t srcVertexCount = static_cast<uint32_t>(posAccessor.count);
-    
-    // Get source indices count
-    uint32_t srcIndicesCount;
-    if (primitive.indices >= 0) {
-        const auto& indicesAccessor = model.accessors[primitive.indices];
-        srcIndicesCount = static_cast<uint32_t>(indicesAccessor.count);
-    } else {
-        srcIndicesCount = srcVertexCount;
+
+    const auto& positionAccessor = model.accessors[positionIt->second];
+    const uint32_t vertexCount = static_cast<uint32_t>(positionAccessor.count);
+    if (vertexCount == 0) {
+        return true;
     }
-    
-    // Create vertex stream for hashing
+
+    const std::vector<uint32_t> sourceIndices = readIndices(primitive, model, vertexCount);
+    if (primitive.indices >= 0 && sourceIndices.empty()) {
+        std::cerr << "Failed to read primitive indices" << std::endl;
+        return false;
+    }
+
     VertexStream stream(primitive, model);
-    
-    // Create hash table
-    uint32_t tableSize = ceilPowerOfTwo(srcVertexCount + srcVertexCount / 4);
-    std::vector<uint32_t> table(tableSize, EMPTY_U32);
-    std::vector<uint32_t> writeMap(srcVertexCount, EMPTY_U32);
-    
-    // Build index remapping
+    const uint32_t tableSize = ceilPowerOfTwo(std::max<uint32_t>(1, vertexCount + vertexCount / 4));
+    std::vector<uint32_t> table(tableSize, kEmpty);
+    std::vector<uint32_t> remap(vertexCount, kEmpty);
+
     uint32_t dstVertexCount = 0;
-    
-    // Get source indices
-    std::vector<uint32_t> srcIndicesArray;
-    if (primitive.indices >= 0) {
-        const auto& indicesAccessor = model.accessors[primitive.indices];
-        const uint8_t* indicesData = getAccessorData(primitive.indices, model);
-        
-        srcIndicesArray.resize(srcIndicesCount);
-        
-        if (indicesAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT) {
-            const uint16_t* indices16 = reinterpret_cast<const uint16_t*>(indicesData);
-            for (uint32_t i = 0; i < srcIndicesCount; ++i) {
-                srcIndicesArray[i] = indices16[i];
-            }
-        } else if (indicesAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT) {
-            const uint32_t* indices32 = reinterpret_cast<const uint32_t*>(indicesData);
-            for (uint32_t i = 0; i < srcIndicesCount; ++i) {
-                srcIndicesArray[i] = indices32[i];
-            }
-        } else if (indicesAccessor.componentType == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE) {
-            const uint8_t* indices8 = indicesData;
-            for (uint32_t i = 0; i < srcIndicesCount; ++i) {
-                srcIndicesArray[i] = indices8[i];
-            }
+    for (uint32_t srcIdx : sourceIndices) {
+        if (srcIdx >= vertexCount) {
+            continue;
         }
-    } else {
-        srcIndicesArray.resize(srcIndicesCount);
-        for (uint32_t i = 0; i < srcIndicesCount; ++i) {
-            srcIndicesArray[i] = i;
+
+        if (remap[srcIdx] != kEmpty) {
+            continue;
         }
-    }
-    
-    // Compare and identify indices to weld - process unique vertices only
-    std::vector<uint32_t> uniqueVertices;
-    uniqueVertices.reserve(srcVertexCount);
-    
-    for (uint32_t i = 0; i < srcIndicesCount; ++i) {
-        uint32_t srcIndex = srcIndicesArray[i];
-        if (writeMap[srcIndex] == EMPTY_U32) {
-            uniqueVertices.push_back(srcIndex);
-            writeMap[srcIndex] = 0; // Mark as seen
-        }
-    }
-    
-    // Reset writeMap and process unique vertices only
-    for (uint32_t srcIndex : uniqueVertices) {
-        writeMap[srcIndex] = EMPTY_U32;
-    }
-    
-    for (uint32_t srcIndex : uniqueVertices) {
-        uint32_t hashIndex = hashLookup(table, tableSize, stream, srcIndex, EMPTY_U32);
-        uint32_t dstIndex = table[hashIndex];
-        
-        if (dstIndex == EMPTY_U32) {
-            table[hashIndex] = srcIndex;
-            writeMap[srcIndex] = dstVertexCount++;
+
+        const uint32_t slot = findSlot(table, tableSize, stream, srcIdx);
+        if (table[slot] == kEmpty) {
+            table[slot] = srcIdx;
+            remap[srcIdx] = dstVertexCount++;
         } else {
-            writeMap[srcIndex] = writeMap[dstIndex];
+            remap[srcIdx] = remap[table[slot]];
         }
     }
-    
-    if (options.verbose) {
-        std::cout << "  Welded: " << srcVertexCount << " → " << dstVertexCount 
-                 << " vertices (" << (srcVertexCount - dstVertexCount) << " removed)" << std::endl;
+
+    if (dstVertexCount == 0) {
+        return true;
     }
-    
-    // Compact primitive
-    return compactPrimitive(primitive, mesh, model, writeMap, dstVertexCount);
+
+    if (options.verbose) {
+        std::cout << "  Welded: " << vertexCount << " → " << dstVertexCount
+                  << " vertices (" << (vertexCount - dstVertexCount) << " removed)" << std::endl;
+    }
+
+    return compactPrimitive(primitive, model, sourceIndices, remap, dstVertexCount);
 }
 
+} // namespace
+
 bool GltfWeld::process(tinygltf::Model& model, const WeldOptions& options) {
-    int primitivesWelded = 0;
-    int meshesProcessed = 0;
-    
+    int weldedPrimitives = 0;
+    int touchedMeshes = 0;
+
     for (auto& mesh : model.meshes) {
-        bool meshModified = false;
-        
-        for (auto& prim : mesh.primitives) {
-            if (weldPrimitive(prim, mesh, model, options)) {
-                primitivesWelded++;
-                meshModified = true;
+        bool meshChanged = false;
+        for (auto& primitive : mesh.primitives) {
+            if (weldPrimitive(primitive, model, options)) {
+                meshChanged = true;
+                ++weldedPrimitives;
             }
         }
-        
-        if (meshModified) {
-            meshesProcessed++;
+        if (meshChanged) {
+            ++touchedMeshes;
         }
     }
-    
+
     if (options.verbose) {
-        std::cout << "Weld complete: processed " << meshesProcessed << " meshes, "
-                 << "welded " << primitivesWelded << " primitives" << std::endl;
+        std::cout << "Weld complete: processed " << touchedMeshes << " meshes, welded "
+                  << weldedPrimitives << " primitives" << std::endl;
     }
-    
+
     return true;
 }
 
