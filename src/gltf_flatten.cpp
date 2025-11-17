@@ -17,83 +17,6 @@ static std::vector<double> identityMatrix() {
     };
 }
 
-// Helper: Matrix decomposition (extract translation from matrix)
-static void decomposeMatrix(const std::vector<double>& mat, 
-                           std::vector<double>& translation,
-                           std::vector<double>& rotation,
-                           std::vector<double>& scale) {
-    // Extract translation (rightmost column)
-    translation = {mat[12], mat[13], mat[14]};
-    
-    // Extract scale with proper sign handling
-    double sx = std::sqrt(mat[0]*mat[0] + mat[1]*mat[1] + mat[2]*mat[2]);
-    double sy = std::sqrt(mat[4]*mat[4] + mat[5]*mat[5] + mat[6]*mat[6]);
-    double sz = std::sqrt(mat[8]*mat[8] + mat[9]*mat[9] + mat[10]*mat[10]);
-    
-    // Check for negative scale using determinant
-    // det(M) = det(R) * sx * sy * sz, and det(R) = 1 for pure rotation
-    // So if det(M) < 0, one of the scales must be negative
-    double det = mat[0] * (mat[5]*mat[10] - mat[6]*mat[9])
-               - mat[1] * (mat[4]*mat[10] - mat[6]*mat[8])
-               + mat[2] * (mat[4]*mat[9] - mat[5]*mat[8]);
-    
-    if (det < 0) {
-        sz = -sz; // By convention, negate Z scale for negative determinant
-    }
-    
-    scale = {sx, sy, sz};
-    
-    // Extract rotation (normalized rotation matrix)
-    // Initialize to identity to handle zero scale cases
-    std::vector<double> rotMat = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-    
-    if (std::abs(sx) > 1e-10) { 
-        rotMat[0] = mat[0]/sx; rotMat[1] = mat[1]/sx; rotMat[2] = mat[2]/sx; 
-    }
-    if (std::abs(sy) > 1e-10) { 
-        rotMat[3] = mat[4]/sy; rotMat[4] = mat[5]/sy; rotMat[5] = mat[6]/sy; 
-    }
-    if (std::abs(sz) > 1e-10) { 
-        rotMat[6] = mat[8]/sz; rotMat[7] = mat[9]/sz; rotMat[8] = mat[10]/sz; 
-    }
-    
-    // Convert rotation matrix to quaternion
-    double trace = rotMat[0] + rotMat[4] + rotMat[8];
-    if (trace > 0) {
-        double s = 0.5 / std::sqrt(trace + 1.0);
-        rotation = {
-            (rotMat[7] - rotMat[5]) * s,
-            (rotMat[2] - rotMat[6]) * s,
-            (rotMat[3] - rotMat[1]) * s,
-            0.25 / s
-        };
-    } else if (rotMat[0] > rotMat[4] && rotMat[0] > rotMat[8]) {
-        double s = 2.0 * std::sqrt(1.0 + rotMat[0] - rotMat[4] - rotMat[8]);
-        rotation = {
-            0.25 * s,
-            (rotMat[1] + rotMat[3]) / s,
-            (rotMat[2] + rotMat[6]) / s,
-            (rotMat[7] - rotMat[5]) / s
-        };
-    } else if (rotMat[4] > rotMat[8]) {
-        double s = 2.0 * std::sqrt(1.0 + rotMat[4] - rotMat[0] - rotMat[8]);
-        rotation = {
-            (rotMat[1] + rotMat[3]) / s,
-            0.25 * s,
-            (rotMat[5] + rotMat[7]) / s,
-            (rotMat[2] - rotMat[6]) / s
-        };
-    } else {
-        double s = 2.0 * std::sqrt(1.0 + rotMat[8] - rotMat[0] - rotMat[4]);
-        rotation = {
-            (rotMat[2] + rotMat[6]) / s,
-            (rotMat[5] + rotMat[7]) / s,
-            0.25 * s,
-            (rotMat[3] - rotMat[1]) / s
-        };
-    }
-}
-
 std::vector<double> GltfFlatten::getNodeMatrix(const tinygltf::Node& node) {
     // If node has a matrix property, use it directly
     if (!node.matrix.empty() && node.matrix.size() == 16) {
@@ -140,13 +63,10 @@ std::vector<double> GltfFlatten::getNodeMatrix(const tinygltf::Node& node) {
 }
 
 void GltfFlatten::setNodeMatrix(tinygltf::Node& node, const std::vector<double>& matrix) {
-    std::vector<double> translation, rotation, scale;
-    decomposeMatrix(matrix, translation, rotation, scale);
-    
-    node.translation = translation;
-    node.rotation = rotation;
-    node.scale = scale;
-    node.matrix.clear(); // Clear matrix property, use TRS instead
+    node.matrix = matrix;
+    node.translation.clear();
+    node.rotation.clear();
+    node.scale.clear();
 }
 
 std::vector<double> GltfFlatten::multiplyMatrices(const std::vector<double>& a, const std::vector<double>& b) {
