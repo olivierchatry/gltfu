@@ -1,13 +1,19 @@
 #include "gltf_prune.h"
 #include <iostream>
 #include <algorithm>
+#include <sstream>
 #include <unordered_map>
 
 namespace gltfu {
 
 bool GltfPrune::process(tinygltf::Model& model, const PruneOptions& options) {
-    std::cout << "Pruning unused resources..." << std::endl;
-    
+    error_.clear();
+    stats_.clear();
+
+    if (options.verbose) {
+        std::cout << "[prune] Pruning unused resources" << std::endl;
+    }
+
     // Track which resources are actually used
     std::unordered_set<int> usedNodes;
     std::unordered_set<int> usedMeshes;
@@ -353,22 +359,35 @@ bool GltfPrune::process(tinygltf::Model& model, const PruneOptions& options) {
                       removedBuffers + removedSkins + removedCameras;
     
     if (totalRemoved > 0) {
-        std::cout << "Removed:" << std::endl;
-        if (removedNodes > 0) std::cout << "  Nodes: " << removedNodes << std::endl;
-        if (removedMeshes > 0) std::cout << "  Meshes: " << removedMeshes << std::endl;
-        if (removedMaterials > 0) std::cout << "  Materials: " << removedMaterials << std::endl;
-        if (removedAccessors > 0) std::cout << "  Accessors: " << removedAccessors << std::endl;
-        if (removedTextures > 0) std::cout << "  Textures: " << removedTextures << std::endl;
-        if (removedImages > 0) std::cout << "  Images: " << removedImages << std::endl;
-        if (removedSamplers > 0) std::cout << "  Samplers: " << removedSamplers << std::endl;
-        if (removedBufferViews > 0) std::cout << "  Buffer Views: " << removedBufferViews << std::endl;
-        if (removedBuffers > 0) std::cout << "  Buffers: " << removedBuffers << std::endl;
-        if (removedSkins > 0) std::cout << "  Skins: " << removedSkins << std::endl;
-        if (removedCameras > 0) std::cout << "  Cameras: " << removedCameras << std::endl;
+        std::ostringstream stream;
+        stream << "Total removed: " << totalRemoved;
+        const auto append = [&stream](const char* label, int count) {
+            if (count > 0) {
+                stream << '\n' << "  " << label << ": " << count;
+            }
+        };
+
+        append("Nodes", removedNodes);
+        append("Meshes", removedMeshes);
+        append("Materials", removedMaterials);
+        append("Accessors", removedAccessors);
+        append("Textures", removedTextures);
+        append("Images", removedImages);
+        append("Samplers", removedSamplers);
+        append("Buffer Views", removedBufferViews);
+        append("Buffers", removedBuffers);
+        append("Skins", removedSkins);
+        append("Cameras", removedCameras);
+
+        stats_ = stream.str();
     } else {
-        std::cout << "No unused resources found." << std::endl;
+        stats_ = "No unused resources found";
     }
-    
+
+    if (options.verbose) {
+        std::cout << "[prune] " << stats_ << std::endl;
+    }
+
     return true;
 }
 

@@ -14,6 +14,7 @@ struct PruneOptions {
     bool keepLeaves = false;        // Keep empty leaf nodes
     bool keepAttributes = false;     // Keep unused vertex attributes
     bool keepExtras = false;         // Prevent pruning properties with custom extras
+    bool verbose = false;            // Emit pruning summary to stdout
 };
 
 /**
@@ -34,8 +35,14 @@ public:
      * @return true if successful
      */
     bool process(tinygltf::Model& model, const PruneOptions& options = PruneOptions());
+
+    std::string getStats() const { return stats_; }
+    std::string getError() const { return error_; }
     
 private:
+    std::string stats_;
+    std::string error_;
+
     // Mark all resources reachable from scenes
     void markReachableFromScenes(const tinygltf::Model& model,
                                    std::unordered_set<int>& usedNodes,

@@ -658,6 +658,7 @@ int main(int argc, char** argv) {
     bool keepLeaves = false;
     bool keepAttributes = false;
     bool keepExtras = false;
+    bool pruneVerbose = false;
     bool pruneEmbedImages = false;
     bool pruneEmbedBuffers = false;
     bool prunePrettyPrint = true;
@@ -678,6 +679,9 @@ int main(int argc, char** argv) {
     
     pruneCmd->add_flag("--keep-extras", keepExtras,
                       "Prevent pruning properties with custom extras");
+
+    pruneCmd->add_flag("-v,--verbose", pruneVerbose,
+                      "Show pruning summary");
     
     pruneCmd->add_flag("--embed-images", pruneEmbedImages, 
                       "Embed images in output file");
@@ -690,7 +694,9 @@ int main(int argc, char** argv) {
                       "Disable JSON pretty printing");
     
     pruneCmd->add_flag("--binary", pruneWriteBinary, 
-                       "Write binary .glb output (auto-detected from .glb extension)");    pruneCmd->callback([&]() {
+                       "Write binary .glb output (auto-detected from .glb extension)");
+
+    pruneCmd->callback([&]() {
         gltfu::ProgressReporter progress(
             jsonProgress ? gltfu::ProgressReporter::Format::JSON : gltfu::ProgressReporter::Format::Text
         );
@@ -729,10 +735,21 @@ int main(int argc, char** argv) {
         options.keepLeaves = keepLeaves;
         options.keepAttributes = keepAttributes;
         options.keepExtras = keepExtras;
-        
-        if (!pruner.process(model)) {
-            progress.error("prune", "Prune operation failed");
+        options.verbose = pruneVerbose;
+
+        if (!pruner.process(model, options)) {
+            const auto error = pruner.getError();
+            progress.error("prune", error.empty() ? "Prune operation failed" : error);
             return 1;
+        }
+
+        const auto stats = pruner.getStats();
+        if (!stats.empty()) {
+            if (jsonProgress || pruneVerbose) {
+                progress.report("prune", "Pruning complete", 0.6, stats);
+            } else {
+                std::cout << stats << std::endl;
+            }
         }
         
         // When writing to GLB, clear buffer URIs so data is embedded in binary chunk
@@ -1156,10 +1173,18 @@ int main(int argc, char** argv) {
             gltfu::PruneOptions pruneOpts;
             pruneOpts.keepLeaves = false;
             pruneOpts.keepAttributes = false;
+            pruneOpts.verbose = optimVerbose;
             
             if (!pruner.process(model, pruneOpts)) {
                 progress.error("optim", "Prune operation failed");
                 return 1;
+            }
+
+            if (optimVerbose) {
+                const auto stats = pruner.getStats();
+                if (!stats.empty()) {
+                    std::cout << "  " << stats << std::endl;
+                }
             }
         }
         
