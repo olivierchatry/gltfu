@@ -52,8 +52,8 @@ struct CompressOptions {
  */
 class GltfCompress {
 public:
-    GltfCompress();
-    ~GltfCompress();
+    GltfCompress() = default;
+    ~GltfCompress() = default;
 
     /**
      * Compress all meshes in the model using Draco compression
@@ -76,15 +76,6 @@ public:
 private:
     std::string error_;
     std::string stats_;
-
-#ifdef GLTFU_ENABLE_DRACO
-    // Compress a single primitive
-    bool compressPrimitive(tinygltf::Model& model,
-                          tinygltf::Mesh& mesh,
-                          size_t primitiveIndex,
-                          const CompressOptions& options,
-                          std::vector<uint8_t>& compressedData);
-#endif
 };
 
 } // namespace gltfu
