@@ -428,6 +428,7 @@ int main(int argc, char** argv) {
     std::string joinOutputFile;
     bool keepMeshes = false;
     bool keepNamed = false;
+    bool joinVerbose = false;
     bool joinEmbedImages = false;
     bool joinEmbedBuffers = false;
     bool joinPrettyPrint = true;
@@ -445,6 +446,9 @@ int main(int argc, char** argv) {
     
     joinCmd->add_flag("--keep-named", keepNamed,
                       "Keep named meshes and nodes separate");
+
+    joinCmd->add_flag("-v,--verbose", joinVerbose,
+                      "Show joining summary");
     
     joinCmd->add_flag("--embed-images", joinEmbedImages, 
                       "Embed images in output file");
@@ -498,10 +502,20 @@ int main(int argc, char** argv) {
         gltfu::JoinOptions options;
         options.keepMeshes = keepMeshes;
         options.keepNamed = keepNamed;
+        options.verbose = joinVerbose;
         
         if (!joiner.process(model, options)) {
             progress.error("join", "Join operation failed");
             return 1;
+        }
+
+        const auto stats = joiner.getStats();
+        if (!stats.empty()) {
+            if (jsonProgress || joinVerbose) {
+                progress.report("join", "Join complete", 0.6, stats);
+            } else {
+                std::cout << stats << std::endl;
+            }
         }
         
         // When writing to GLB, clear buffer URIs so data is embedded in binary chunk
@@ -794,6 +808,7 @@ int main(int argc, char** argv) {
     float simplifyRatio = 0.5f;
     float simplifyError = 0.01f;
     bool simplifyLockBorder = false;
+    bool simplifyVerbose = false;
     
     bool simplifyEmbedImages = false;
     bool simplifyEmbedBuffers = false;
@@ -817,6 +832,9 @@ int main(int argc, char** argv) {
     
     simplifyCmd->add_flag("-l,--lock-border", simplifyLockBorder,
         "Lock border vertices to prevent mesh from shrinking");
+
+    simplifyCmd->add_flag("-v,--verbose", simplifyVerbose,
+        "Show simplification summary");
     
     simplifyCmd->add_flag("--embed-images", simplifyEmbedImages, 
         "Embed images as data URIs");
@@ -872,10 +890,21 @@ int main(int argc, char** argv) {
         options.ratio = simplifyRatio;
         options.error = simplifyError;
         options.lockBorder = simplifyLockBorder;
+        options.verbose = simplifyVerbose;
         
         if (!simplifier.process(model, options)) {
-            progress.error("simplify", "Simplify operation failed");
+            const auto error = simplifier.getError();
+            progress.error("simplify", error.empty() ? "Simplify operation failed" : error);
             return 1;
+        }
+
+        const auto simplifyStats = simplifier.getStats();
+        if (!simplifyStats.empty()) {
+            if (jsonProgress || simplifyVerbose) {
+                progress.report("simplify", "Simplification complete", 0.6, simplifyStats);
+            } else {
+                std::cout << simplifyStats << std::endl;
+            }
         }
         
         // When writing to GLB, clear buffer URIs so data is embedded in binary chunk
@@ -1108,6 +1137,13 @@ int main(int argc, char** argv) {
                 progress.error("optim", "Join operation failed");
                 return 1;
             }
+
+            if (optimVerbose) {
+                const auto stats = joiner.getStats();
+                if (!stats.empty()) {
+                    std::cout << "  " << stats << std::endl;
+                }
+            }
         }
         
         // Step 5: Weld vertices (in-place)
@@ -1134,10 +1170,18 @@ int main(int argc, char** argv) {
             simplifyOpts.ratio = optimSimplifyRatio;
             simplifyOpts.error = optimSimplifyError;
             simplifyOpts.lockBorder = optimLockBorder;
+            simplifyOpts.verbose = optimVerbose;
             
             if (!simplifier.process(model, simplifyOpts)) {
                 progress.error("optim", "Simplify operation failed");
                 return 1;
+            }
+
+            if (optimVerbose) {
+                const auto stats = simplifier.getStats();
+                if (!stats.empty()) {
+                    std::cout << "  " << stats << std::endl;
+                }
             }
         }
         

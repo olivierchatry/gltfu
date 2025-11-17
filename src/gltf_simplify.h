@@ -12,6 +12,7 @@ struct SimplifyOptions {
     float ratio = 0.0f;          // Target ratio (0-1) of vertices to keep (0 = maximum simplification)
     float error = 0.0001f;       // Error threshold as fraction of mesh radius (default 0.01%)
     bool lockBorder = false;     // Lock topological borders of the mesh
+    bool verbose = false;        // Emit simplification summary
 };
 
 /**
@@ -32,12 +33,25 @@ public:
      * @return true if successful
      */
     bool process(tinygltf::Model& model, const SimplifyOptions& options = SimplifyOptions());
+    std::string getStats() const { return stats_; }
+    std::string getError() const { return error_; }
     
 private:
+    std::string stats_;
+    std::string error_;
+
+    struct PrimitiveSummary {
+        size_t originalTriangles = 0;
+        size_t simplifiedTriangles = 0;
+        float error = 0.0f;
+        std::string reason;
+    };
+
     // Simplify a single primitive
     bool simplifyPrimitive(tinygltf::Primitive& primitive,
                           tinygltf::Model& model,
-                          const SimplifyOptions& options);
+                          const SimplifyOptions& options,
+                          PrimitiveSummary& summary);
     
     // Get accessor element count
     size_t getAccessorCount(const tinygltf::Accessor& accessor) const;

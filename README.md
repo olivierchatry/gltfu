@@ -34,10 +34,10 @@ cmake --build build -j
 - **dedupe** `gltfu dedupe <input> -o <output>` — collapse duplicate resources; toggles `--accessors`, `--meshes`, `--materials`, `--textures`, plus `--keep-unique-names`, `-v,--verbose`, and output flags.
 - **info** `gltfu info <input>` — print model statistics; add `-v,--verbose` for extended data.
 - **flatten** `gltfu flatten <input> -o <output>` — collapse node hierarchy; optional `--no-cleanup` and output flags.
-- **join** `gltfu join <input> -o <output>` — merge compatible primitives; use `--keep-meshes` to stay within a mesh and `--keep-named` to skip named meshes/nodes.
+- **join** `gltfu join <input> -o <output>` — merge compatible primitives; use `--keep-meshes` to stay within a mesh, `--keep-named` to skip named meshes/nodes, and `-v,--verbose` for a per-mesh summary.
 - **weld** `gltfu weld <input> -o <output>` — deduplicate vertices; `--overwrite` replaces index buffers in place.
-- **prune** `gltfu prune <input> -o <output>` — drop unused resources; control with `--keep-leaves`, `--keep-attributes`, and `--keep-extras`.
-- **simplify** `gltfu simplify <input> -o <output>` — meshoptimizer-based decimation with `-r,--ratio`, `-e,--error`, `-l,--lock-border`, and the usual output flags.
+- **prune** `gltfu prune <input> -o <output>` — drop unused resources; control with `--keep-leaves`, `--keep-attributes`, `--keep-extras`, and `-v,--verbose` for a removal summary.
+- **simplify** `gltfu simplify <input> -o <output>` — meshoptimizer-based decimation with `-r,--ratio`, `-e,--error`, `-l,--lock-border`, `-v,--verbose`, and the usual output flags.
 - **optim** `gltfu optim <inputs...> -o <output>` — run merge → dedupe → flatten → join → weld → prune, with optional `--simplify`, `--simplify-ratio`, `--simplify-error`, `--simplify-lock-border`, and (when built with Draco) `--compress` plus the `--compress-*-bits` knobs. Skip stages via `--skip-dedupe`, `--skip-flatten`, `--skip-join`, `--skip-weld`, or `--skip-prune`. Add `-v,--verbose` for per-stage stats.
 
 ### Examples
