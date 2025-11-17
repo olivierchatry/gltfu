@@ -1,792 +1,724 @@
 #include "gltf_dedup.h"
 
+#include "progress_reporter.h"
+
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
-#include <iostream>
-#include <unordered_map>
-#include <unordered_set>
-#include <sstream>
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <sstream>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace gltfu {
+namespace {
 
-GltfDedup::GltfDedup() {}
+using DuplicateMap = std::unordered_map<int, int>;
 
-GltfDedup::~GltfDedup() = default;
+struct DedupReport {
+    size_t original = 0;
+    size_t removed = 0;
+    size_t remaining = 0;
+};
 
-bool GltfDedup::process(tinygltf::Model& model, const Options& options) {
-    errorMsg_.clear();
-    stats_.clear();
-    
-    try {
-        if (options.dedupAccessors) {
-            dedupAccessors(model, options);
+class Reporter {
+public:
+    Reporter(const DedupOptions& options, const char* operation)
+        : options_(options), operation_(operation) {}
+
+    void log(const std::string& message,
+             double progress = -1.0,
+             const std::string& details = "") const {
+        if (options_.progressReporter) {
+            options_.progressReporter->report(operation_, message, progress, details);
+            return;
         }
-        
-        if (options.dedupTextures) {
-            dedupTextures(model, options);
+
+        if (!options_.verbose) {
+            return;
         }
-        
-        if (options.dedupMaterials) {
-            dedupMaterials(model, options);
+
+        std::cout << '[' << operation_ << "] " << message;
+        if (progress >= 0.0) {
+            std::cout << " (" << static_cast<int>(progress * 100.0) << "%)";
         }
-        
-        if (options.dedupMeshes) {
-            dedupMeshes(model, options);
+        if (!details.empty()) {
+            std::cout << " - " << details;
         }
-        
-        return true;
-    } catch (const std::exception& e) {
-        errorMsg_ = std::string("Deduplication failed: ") + e.what();
+        std::cout << std::endl;
+    }
+
+private:
+    const DedupOptions& options_;
+    const char* operation_;
+};
+
+uint64_t hashBuffer(const unsigned char* data, size_t size) {
+    if (!data || size == 0) {
+        return 0;
+    }
+    return XXH64(data, size, 0);
+}
+
+bool buffersEqual(const std::vector<unsigned char>& a,
+                  const std::vector<unsigned char>& b) {
+    return a.size() == b.size() &&
+           (a.empty() || std::memcmp(a.data(), b.data(), a.size()) == 0);
+}
+
+std::string accessorMetadata(const tinygltf::Accessor& accessor) {
+    std::ostringstream stream;
+    stream << accessor.count << ':'
+           << accessor.type << ':'
+           << accessor.componentType << ':'
+           << accessor.normalized << ':'
+           << accessor.bufferView << ':'
+           << accessor.byteOffset << ':'
+           << accessor.sparse.isSparse;
+    return stream.str();
+}
+
+struct AccessorView {
+    const unsigned char* data = nullptr;
+    size_t stride = 0;
+    size_t elementSize = 0;
+};
+
+bool resolveAccessorView(const tinygltf::Model& model,
+                         const tinygltf::Accessor& accessor,
+                         AccessorView& view) {
+    if (accessor.bufferView < 0 ||
+        accessor.bufferView >= static_cast<int>(model.bufferViews.size())) {
         return false;
     }
+
+    const auto& bufferView = model.bufferViews[accessor.bufferView];
+    if (bufferView.buffer < 0 ||
+        bufferView.buffer >= static_cast<int>(model.buffers.size())) {
+        return false;
+    }
+
+    const auto& buffer = model.buffers[bufferView.buffer];
+    if (buffer.data.empty()) {
+        return false;
+    }
+
+    const size_t componentSize = tinygltf::GetComponentSizeInBytes(accessor.componentType);
+    const size_t componentCount = tinygltf::GetNumComponentsInType(accessor.type);
+    if (componentSize == 0 || componentCount == 0) {
+        return false;
+    }
+
+    view.elementSize = componentSize * componentCount;
+    view.stride = bufferView.byteStride > 0 ? bufferView.byteStride : view.elementSize;
+
+    const size_t offset = bufferView.byteOffset + accessor.byteOffset;
+    const size_t required = offset + view.stride * (accessor.count ? accessor.count - 1 : 0) + view.elementSize;
+    if (required > buffer.data.size()) {
+        return false;
+    }
+
+    view.data = buffer.data.data() + offset;
+    return true;
 }
 
-std::string GltfDedup::getStats() const {
-    return stats_;
+uint64_t accessorContentHash(const tinygltf::Model& model,
+                             const tinygltf::Accessor& accessor) {
+    AccessorView view;
+    if (!resolveAccessorView(model, accessor, view)) {
+        return 0;
+    }
+
+    if (view.stride == view.elementSize) {
+        return hashBuffer(view.data, view.elementSize * accessor.count);
+    }
+
+    XXH64_state_t* state = XXH64_createState();
+    XXH64_reset(state, 0);
+    for (size_t i = 0; i < accessor.count; ++i) {
+        XXH64_update(state, view.data + i * view.stride, view.elementSize);
+    }
+    const uint64_t hash = XXH64_digest(state);
+    XXH64_freeState(state);
+    return hash;
 }
 
-bool GltfDedup::buffersEqual(const std::vector<unsigned char>& a, 
-                             const std::vector<unsigned char>& b) const {
-    if (a.size() != b.size()) return false;
-    return std::memcmp(a.data(), b.data(), a.size()) == 0;
+bool accessorsEqual(const tinygltf::Model& model,
+                    const tinygltf::Accessor& lhs,
+                    const tinygltf::Accessor& rhs) {
+    if (lhs.count != rhs.count) {
+        return false;
+    }
+
+    AccessorView left;
+    AccessorView right;
+    if (!resolveAccessorView(model, lhs, left) ||
+        !resolveAccessorView(model, rhs, right)) {
+        return false;
+    }
+
+    if (left.elementSize != right.elementSize) {
+        return false;
+    }
+
+    if (left.stride == right.stride && left.stride == left.elementSize) {
+        return std::memcmp(left.data,
+                           right.data,
+                           lhs.count * left.elementSize) == 0;
+    }
+
+    for (size_t i = 0; i < lhs.count; ++i) {
+        const unsigned char* a = left.data + i * left.stride;
+        const unsigned char* b = right.data + i * right.stride;
+        if (std::memcmp(a, b, left.elementSize) != 0) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
-std::string GltfDedup::createAccessorHash(const tinygltf::Accessor& accessor) const {
-    std::stringstream ss;
-    ss << accessor.count << ":"
-       << accessor.type << ":"
-       << accessor.componentType << ":"
-       << accessor.normalized << ":"
-       << accessor.sparse.isSparse;
-    return ss.str();
+std::vector<int> buildRemap(size_t size, const DuplicateMap& duplicates) {
+    std::vector<int> remap(size, -1);
+    int next = 0;
+
+    for (size_t i = 0; i < size; ++i) {
+        if (!duplicates.count(static_cast<int>(i))) {
+            remap[i] = next++;
+        }
+    }
+
+    for (size_t i = 0; i < size; ++i) {
+        auto it = duplicates.find(static_cast<int>(i));
+        if (it != duplicates.end()) {
+            remap[i] = remap[it->second];
+        }
+    }
+
+    return remap;
 }
 
-std::string GltfDedup::createMaterialHash(const tinygltf::Material& material) const {
-    std::stringstream ss;
-    
-    // Hash PBR metallic roughness
+template <typename T>
+void compactVector(std::vector<T>& elements, const DuplicateMap& duplicates) {
+    if (duplicates.empty()) {
+        return;
+    }
+
+    std::vector<T> compacted;
+    compacted.reserve(elements.size() - duplicates.size());
+    for (size_t i = 0; i < elements.size(); ++i) {
+        if (!duplicates.count(static_cast<int>(i))) {
+            compacted.push_back(std::move(elements[i]));
+        }
+    }
+    elements = std::move(compacted);
+}
+
+void applyAccessorRemap(tinygltf::Model& model, const std::vector<int>& remap) {
+    auto update = [&](int& idx) {
+        if (idx >= 0 && idx < static_cast<int>(remap.size())) {
+            idx = remap[idx];
+        }
+    };
+
+    for (auto& mesh : model.meshes) {
+        for (auto& primitive : mesh.primitives) {
+            for (auto& attribute : primitive.attributes) {
+                update(attribute.second);
+            }
+            update(primitive.indices);
+            for (auto& target : primitive.targets) {
+                for (auto& entry : target) {
+                    update(entry.second);
+                }
+            }
+        }
+    }
+
+    for (auto& animation : model.animations) {
+        for (auto& sampler : animation.samplers) {
+            update(sampler.input);
+            update(sampler.output);
+        }
+    }
+
+    for (auto& skin : model.skins) {
+        update(skin.inverseBindMatrices);
+    }
+}
+
+std::string materialKey(const tinygltf::Material& material,
+                        bool keepUniqueNames) {
+    std::ostringstream stream;
+    if (keepUniqueNames && !material.name.empty()) {
+        stream << material.name << ';';
+    }
+
     const auto& pbr = material.pbrMetallicRoughness;
-    for (double v : pbr.baseColorFactor) ss << v << ";";
-    ss << pbr.baseColorTexture.index << ";";
-    ss << pbr.baseColorTexture.texCoord << ";";
-    // Hash TextureInfo extensions (like KHR_texture_transform)
-    if (!pbr.baseColorTexture.extensions.empty()) {
-        for (const auto& [extName, extValue] : pbr.baseColorTexture.extensions) {
-            ss << "bcTexExt:" << extName << ";";
-        }
+    for (double value : pbr.baseColorFactor) {
+        stream << value << ';';
     }
-    
-    ss << pbr.metallicFactor << ";";
-    ss << pbr.roughnessFactor << ";";
-    ss << pbr.metallicRoughnessTexture.index << ";";
-    ss << pbr.metallicRoughnessTexture.texCoord << ";";
-    if (!pbr.metallicRoughnessTexture.extensions.empty()) {
-        for (const auto& [extName, extValue] : pbr.metallicRoughnessTexture.extensions) {
-            ss << "mrTexExt:" << extName << ";";
-        }
+    stream << pbr.baseColorTexture.index << ';'
+           << pbr.baseColorTexture.texCoord << ';';
+    for (const auto& extension : pbr.baseColorTexture.extensions) {
+        stream << "bc:" << extension.first << ';';
     }
-    
-    // Hash normal texture (NormalTextureInfo has scale property)
-    ss << material.normalTexture.index << ";";
-    ss << material.normalTexture.texCoord << ";";
-    ss << material.normalTexture.scale << ";";
-    if (!material.normalTexture.extensions.empty()) {
-        for (const auto& [extName, extValue] : material.normalTexture.extensions) {
-            ss << "nTexExt:" << extName << ";";
-        }
+
+    stream << pbr.metallicFactor << ';'
+           << pbr.roughnessFactor << ';'
+           << pbr.metallicRoughnessTexture.index << ';'
+           << pbr.metallicRoughnessTexture.texCoord << ';';
+    for (const auto& extension : pbr.metallicRoughnessTexture.extensions) {
+        stream << "mr:" << extension.first << ';';
     }
-    
-    // Hash occlusion texture (OcclusionTextureInfo has strength property)
-    ss << material.occlusionTexture.index << ";";
-    ss << material.occlusionTexture.texCoord << ";";
-    ss << material.occlusionTexture.strength << ";";
-    if (!material.occlusionTexture.extensions.empty()) {
-        for (const auto& [extName, extValue] : material.occlusionTexture.extensions) {
-            ss << "oTexExt:" << extName << ";";
-        }
+
+    stream << material.normalTexture.index << ';'
+           << material.normalTexture.texCoord << ';'
+           << material.normalTexture.scale << ';';
+    for (const auto& extension : material.normalTexture.extensions) {
+        stream << "n:" << extension.first << ';';
     }
-    
-    // Hash emissive properties
-    ss << material.emissiveTexture.index << ";";
-    ss << material.emissiveTexture.texCoord << ";";
-    if (!material.emissiveTexture.extensions.empty()) {
-        for (const auto& [extName, extValue] : material.emissiveTexture.extensions) {
-            ss << "eTexExt:" << extName << ";";
-        }
+
+    stream << material.occlusionTexture.index << ';'
+           << material.occlusionTexture.texCoord << ';'
+           << material.occlusionTexture.strength << ';';
+    for (const auto& extension : material.occlusionTexture.extensions) {
+        stream << "o:" << extension.first << ';';
     }
-    for (double v : material.emissiveFactor) ss << v << ";";
-    
-    // Hash alpha properties
-    ss << material.alphaMode << ";";
-    ss << material.alphaCutoff << ";";
-    ss << material.doubleSided << ";";
-    
-    // Hash material extensions (like KHR_materials_*)
-    if (!material.extensions.empty()) {
-        for (const auto& [extName, extValue] : material.extensions) {
-            ss << "matExt:" << extName << ";";
-        }
+
+    stream << material.emissiveTexture.index << ';'
+           << material.emissiveTexture.texCoord << ';';
+    for (const auto& extension : material.emissiveTexture.extensions) {
+        stream << "e:" << extension.first << ';';
     }
-    
-    // Hash extras if present
+
+    for (double value : material.emissiveFactor) {
+        stream << value << ';';
+    }
+
+    stream << material.alphaMode << ';'
+           << material.alphaCutoff << ';'
+           << material.doubleSided << ';';
+
+    for (const auto& extension : material.extensions) {
+        stream << "mat:" << extension.first << ';';
+    }
+
     if (material.extras.Type() != tinygltf::NULL_TYPE) {
-        ss << "extras;";
+        stream << "extras;";
     }
-    
-    return ss.str();
+
+    return stream.str();
 }
 
-void GltfDedup::dedupAccessors(tinygltf::Model& model, const Options& options) {
-    const size_t originalCount = model.accessors.size();
-    
-    auto reportProgress = [&](const std::string& message, double progress = -1.0, const std::string& details = "") {
-        if (options.progressReporter) {
-            options.progressReporter->report("dedupe-accessors", message, progress, details);
-        } else if (options.verbose) {
-            std::cout << message;
-            if (!details.empty()) std::cout << " - " << details;
-            std::cout << std::endl;
+void applyMaterialRemap(tinygltf::Model& model, const std::vector<int>& remap) {
+    auto update = [&](int& idx) {
+        if (idx >= 0 && idx < static_cast<int>(remap.size())) {
+            idx = remap[idx];
         }
     };
-    
-    reportProgress("Deduplicating accessors", 0.0, std::to_string(originalCount) + " total");
-    
-    // Group accessors by metadata hash AND compute content hash for each
-    std::unordered_map<std::string, std::vector<int>> hashGroups;
-    std::unordered_map<int, uint64_t> contentHashes; // accessor index -> content hash
-    
-    reportProgress("Computing content hashes", 0.1);
-    
-    for (size_t i = 0; i < model.accessors.size(); ++i) {
-        if (i % 10000 == 0 && i > 0) {
-            double hashProgress = 0.1 + 0.3 * static_cast<double>(i) / model.accessors.size();
-            reportProgress("Hashed " + std::to_string(i) + "/" + std::to_string(model.accessors.size()) + " accessors", hashProgress);
-        }
-        
-        const auto& accessor = model.accessors[i];
-        
-        // Create metadata hash
-        std::string metaHash = createAccessorHash(accessor);
-        hashGroups[metaHash].push_back(i);
-        
-        // Compute content hash
-        if (accessor.bufferView >= 0 && accessor.bufferView < (int)model.bufferViews.size()) {
-            const auto& bufferView = model.bufferViews[accessor.bufferView];
-            if (bufferView.buffer >= 0 && bufferView.buffer < (int)model.buffers.size()) {
-                const auto& buffer = model.buffers[bufferView.buffer];
-                
-                size_t offset = bufferView.byteOffset + accessor.byteOffset;
-                size_t stride = bufferView.byteStride > 0 ? bufferView.byteStride : 
-                               tinygltf::GetComponentSizeInBytes(accessor.componentType) * 
-                               tinygltf::GetNumComponentsInType(accessor.type);
-                
-                // Hash the actual data
-                if (bufferView.byteStride == 0 || bufferView.byteStride == stride) {
-                    // Contiguous data - hash directly
-                    size_t size = accessor.count * stride;
-                    if (offset + size <= buffer.data.size()) {
-                        contentHashes[i] = XXH64(&buffer.data[offset], size, 0);
-                    }
-                } else {
-                    // Non-contiguous - need to hash element by element
-                    XXH64_state_t* state = XXH64_createState();
-                    XXH64_reset(state, 0);
-                    
-                    size_t elemSize = tinygltf::GetComponentSizeInBytes(accessor.componentType) *
-                                     tinygltf::GetNumComponentsInType(accessor.type);
-                    
-                    for (size_t k = 0; k < static_cast<size_t>(accessor.count); ++k) {
-                        size_t elemOffset = offset + k * stride;
-                        if (elemOffset + elemSize <= buffer.data.size()) {
-                            XXH64_update(state, &buffer.data[elemOffset], elemSize);
-                        }
-                    }
-                    
-                    contentHashes[i] = XXH64_digest(state);
-                    XXH64_freeState(state);
-                }
-            }
-        }
-    }
-    
-    reportProgress("Grouped into " + std::to_string(hashGroups.size()) + " metadata buckets", 0.4);
-    reportProgress("Finding duplicates using content hashes", 0.5);
-    
-    // Map of duplicate accessor index -> original accessor index
-    std::unordered_map<int, int> duplicates;
-    
-    // For each metadata group, use content hashes to find duplicates
-    size_t groupsProcessed = 0;
-    
-    for (const auto& [metaHash, indices] : hashGroups) {
-        if (indices.size() < 2) continue;
-        
-        groupsProcessed++;
-        // Only report progress for large groups (>1000 accessors) or every 100 groups
-        if ((groupsProcessed % 100 == 0 || indices.size() > 1000) && options.verbose) {
-            double groupProgress = 0.5 + 0.3 * static_cast<double>(groupsProcessed) / hashGroups.size();
-            reportProgress("Group " + std::to_string(groupsProcessed) + "/" + std::to_string(hashGroups.size()), 
-                         groupProgress, std::to_string(indices.size()) + " accessors");
-        }
-        
-        // Group by content hash within this metadata group
-        std::unordered_map<uint64_t, int> contentHashToFirst;
-        
-        for (int idx : indices) {
-            if (duplicates.count(idx)) continue;
-            
-            uint64_t hash = contentHashes[idx];
-            
-            if (contentHashToFirst.count(hash)) {
-                // Found a duplicate!
-                duplicates[idx] = contentHashToFirst[hash];
-            } else {
-                // First occurrence with this content hash
-                contentHashToFirst[hash] = idx;
-            }
-        }
-    }
-    
-    reportProgress("Found " + std::to_string(duplicates.size()) + " duplicates", 0.8);
-    
-    if (duplicates.empty()) {
-        if (options.verbose) {
-            reportProgress("Accessors: No duplicates found", 1.0, std::to_string(originalCount) + " total");
-        }
-        return;
-    }
-    
-    // Update all references to accessors
-    // Update mesh primitives
+
     for (auto& mesh : model.meshes) {
-        for (auto& prim : mesh.primitives) {
-            // Update attributes
-            for (auto& [name, accessorIdx] : prim.attributes) {
-                if (duplicates.count(accessorIdx)) {
-                    accessorIdx = duplicates[accessorIdx];
-                }
-            }
-            
-            // Update indices
-            if (prim.indices >= 0 && duplicates.count(prim.indices)) {
-                prim.indices = duplicates[prim.indices];
-            }
-            
-            // Update morph targets
-            for (auto& target : prim.targets) {
-                for (auto& [name, accessorIdx] : target) {
-                    if (duplicates.count(accessorIdx)) {
-                        accessorIdx = duplicates[accessorIdx];
-                    }
-                }
-            }
+        for (auto& primitive : mesh.primitives) {
+            update(primitive.material);
         }
-    }
-    
-    // Update animations
-    for (auto& animation : model.animations) {
-        for (auto& sampler : animation.samplers) {
-            if (duplicates.count(sampler.input)) {
-                sampler.input = duplicates[sampler.input];
-            }
-            if (duplicates.count(sampler.output)) {
-                sampler.output = duplicates[sampler.output];
-            }
-        }
-    }
-    
-    // Update skins
-    for (auto& skin : model.skins) {
-        if (skin.inverseBindMatrices >= 0 && duplicates.count(skin.inverseBindMatrices)) {
-            skin.inverseBindMatrices = duplicates[skin.inverseBindMatrices];
-        }
-    }
-    
-    // Create index remapping (account for removed accessors)
-    std::vector<int> indexRemap(model.accessors.size());
-    int newIndex = 0;
-    for (size_t i = 0; i < model.accessors.size(); ++i) {
-        if (duplicates.count(i)) {
-            indexRemap[i] = -1;  // Will be removed
-        } else {
-            indexRemap[i] = newIndex++;
-        }
-    }
-    
-    // Remove duplicate accessors
-    std::vector<tinygltf::Accessor> newAccessors;
-    newAccessors.reserve(model.accessors.size() - duplicates.size());
-    for (size_t i = 0; i < model.accessors.size(); ++i) {
-        if (!duplicates.count(i)) {
-            newAccessors.push_back(model.accessors[i]);
-        }
-    }
-    model.accessors = std::move(newAccessors);
-    
-    // Update all references with new indices
-    auto updateIndex = [&indexRemap, &duplicates](int& idx) {
-        if (idx < 0) return;
-        if (duplicates.count(idx)) {
-            idx = indexRemap[duplicates[idx]];
-        } else {
-            idx = indexRemap[idx];
-        }
-    };
-    
-    for (auto& mesh : model.meshes) {
-        for (auto& prim : mesh.primitives) {
-            for (auto& [name, accessorIdx] : prim.attributes) {
-                updateIndex(accessorIdx);
-            }
-            updateIndex(prim.indices);
-            for (auto& target : prim.targets) {
-                for (auto& [name, accessorIdx] : target) {
-                    updateIndex(accessorIdx);
-                }
-            }
-        }
-    }
-    
-    for (auto& animation : model.animations) {
-        for (auto& sampler : animation.samplers) {
-            updateIndex(sampler.input);
-            updateIndex(sampler.output);
-        }
-    }
-    
-    for (auto& skin : model.skins) {
-        updateIndex(skin.inverseBindMatrices);
-    }
-    
-    std::stringstream ss;
-    ss << "Accessors: Merged " << duplicates.size() << " of " << originalCount 
-       << " (" << model.accessors.size() << " remaining)";
-    stats_ += ss.str() + "\n";
-    
-    if (options.verbose) {
-        std::cout << ss.str() << std::endl;
     }
 }
 
-void GltfDedup::dedupMeshes(tinygltf::Model& model, const Options& options) {
-    const size_t originalCount = model.meshes.size();
-    
-    auto reportProgress = [&](const std::string& message, double progress = -1.0, const std::string& details = "") {
-        if (options.progressReporter) {
-            options.progressReporter->report("dedupe-meshes", message, progress, details);
-        } else if (options.verbose) {
-            std::cout << message;
-            if (!details.empty()) std::cout << " - " << details;
-            std::cout << std::endl;
+std::string meshKey(const tinygltf::Mesh& mesh, bool keepUniqueNames) {
+    std::ostringstream stream;
+    if (keepUniqueNames && !mesh.name.empty()) {
+        stream << mesh.name << ';';
+    }
+
+    for (const auto& primitive : mesh.primitives) {
+        stream << "mode:" << primitive.mode << ';'
+               << "material:" << primitive.material << ';'
+               << "indices:" << primitive.indices << ';';
+
+        std::vector<std::pair<std::string, int>> attributes(primitive.attributes.begin(),
+                                                            primitive.attributes.end());
+        std::sort(attributes.begin(), attributes.end());
+        for (const auto& attribute : attributes) {
+            stream << attribute.first << ':' << attribute.second << ';';
+        }
+
+        stream << "targets{";
+        for (const auto& target : primitive.targets) {
+            std::vector<std::pair<std::string, int>> targetAttributes(target.begin(), target.end());
+            std::sort(targetAttributes.begin(), targetAttributes.end());
+            stream << '[';
+            for (const auto& attribute : targetAttributes) {
+                stream << attribute.first << ':' << attribute.second << ';';
+            }
+            stream << ']';
+        }
+        stream << "};";
+    }
+
+    return stream.str();
+}
+
+void applyMeshRemap(tinygltf::Model& model, const std::vector<int>& remap) {
+    auto update = [&](int& idx) {
+        if (idx >= 0 && idx < static_cast<int>(remap.size())) {
+            idx = remap[idx];
         }
     };
-    
-    reportProgress("Deduplicating meshes", 0.0, std::to_string(originalCount) + " total");
-    
-    // Create hash for each mesh based on primitives
-    std::unordered_map<std::string, int> uniqueMeshes;
-    std::unordered_map<int, int> duplicates;  // duplicate index -> original index
-    
-    for (size_t i = 0; i < model.meshes.size(); ++i) {
-        const auto& mesh = model.meshes[i];
-        
-        std::stringstream meshKey;
-        
-        if (options.keepUniqueNames && !mesh.name.empty()) {
-            meshKey << mesh.name << ";";
-        }
-        
-        // Create key from primitives
-        for (const auto& prim : mesh.primitives) {
-            meshKey << "mode:" << prim.mode << ";";
-            meshKey << "material:" << prim.material << ";";
-            meshKey << "indices:" << prim.indices << ";";
-            
-            // Sort attributes for consistent hashing
-            std::vector<std::pair<std::string, int>> sortedAttrs(prim.attributes.begin(), prim.attributes.end());
-            std::sort(sortedAttrs.begin(), sortedAttrs.end());
-            
-            for (const auto& [name, idx] : sortedAttrs) {
-                meshKey << name << ":" << idx << ";";
-            }
-            
-            // Morph targets
-            for (const auto& target : prim.targets) {
-                std::vector<std::pair<std::string, int>> sortedTargetAttrs(target.begin(), target.end());
-                std::sort(sortedTargetAttrs.begin(), sortedTargetAttrs.end());
-                
-                meshKey << "target:[";
-                for (const auto& [name, idx] : sortedTargetAttrs) {
-                    meshKey << name << ":" << idx << ";";
-                }
-                meshKey << "]";
-            }
-            
-            meshKey << "|";
-        }
-        
-        std::string key = meshKey.str();
-        
-        if (uniqueMeshes.count(key)) {
-            duplicates[i] = uniqueMeshes[key];
-        } else {
-            uniqueMeshes[key] = i;
-        }
-    }
-    
-    if (duplicates.empty()) {
-        if (options.verbose) {
-            reportProgress("Meshes: No duplicates found", 1.0, std::to_string(originalCount) + " total");
-        }
-        return;
-    }
-    
-    // Update all references to meshes (in nodes)
+
     for (auto& node : model.nodes) {
-        if (node.mesh >= 0 && duplicates.count(node.mesh)) {
-            node.mesh = duplicates[node.mesh];
-        }
-    }
-    
-    // Create index remapping
-    std::vector<int> indexRemap(model.meshes.size());
-    int newIndex = 0;
-    for (size_t i = 0; i < model.meshes.size(); ++i) {
-        if (duplicates.count(i)) {
-            indexRemap[i] = -1;
-        } else {
-            indexRemap[i] = newIndex++;
-        }
-    }
-    
-    // Remove duplicate meshes
-    std::vector<tinygltf::Mesh> newMeshes;
-    newMeshes.reserve(model.meshes.size() - duplicates.size());
-    for (size_t i = 0; i < model.meshes.size(); ++i) {
-        if (!duplicates.count(i)) {
-            newMeshes.push_back(model.meshes[i]);
-        }
-    }
-    model.meshes = std::move(newMeshes);
-    
-    // Update mesh indices in nodes
-    for (auto& node : model.nodes) {
-        if (node.mesh >= 0) {
-            if (duplicates.count(node.mesh)) {
-                node.mesh = indexRemap[duplicates[node.mesh]];
-            } else {
-                node.mesh = indexRemap[node.mesh];
-            }
-        }
-    }
-    
-    std::stringstream ss;
-    ss << "Meshes: Merged " << duplicates.size() << " of " << originalCount
-       << " (" << model.meshes.size() << " remaining)";
-    stats_ += ss.str() + "\n";
-    
-    if (options.verbose) {
-        std::cout << ss.str() << std::endl;
+        update(node.mesh);
     }
 }
 
-void GltfDedup::dedupMaterials(tinygltf::Model& model, const Options& options) {
-    const size_t originalCount = model.materials.size();
-    
-    auto reportProgress = [&](const std::string& message, double progress = -1.0, const std::string& details = "") {
-        if (options.progressReporter) {
-            options.progressReporter->report("dedupe-materials", message, progress, details);
-        } else if (options.verbose) {
-            std::cout << message;
-            if (!details.empty()) std::cout << " - " << details;
-            std::cout << std::endl;
+std::string imageKey(const tinygltf::Image& image, bool keepUniqueNames) {
+    std::ostringstream stream;
+    if (keepUniqueNames && !image.name.empty()) {
+        stream << image.name << ';';
+    }
+    stream << image.mimeType << ';'
+           << image.width << 'x' << image.height << ';'
+           << image.component << ';'
+           << image.bits << ';'
+           << image.image.size();
+    return stream.str();
+}
+
+std::string textureKey(const tinygltf::Texture& texture, bool keepUniqueNames) {
+    std::ostringstream stream;
+    if (keepUniqueNames && !texture.name.empty()) {
+        stream << texture.name << ';';
+    }
+    stream << "source:" << texture.source << ';'
+           << "sampler:" << texture.sampler;
+    return stream.str();
+}
+
+void applyImageRemap(tinygltf::Model& model, const std::vector<int>& remap) {
+    auto update = [&](int& idx) {
+        if (idx >= 0 && idx < static_cast<int>(remap.size())) {
+            idx = remap[idx];
         }
     };
-    
-    reportProgress("Deduplicating materials", 0.0, std::to_string(originalCount) + " total");
-    
-    std::unordered_map<std::string, int> uniqueMaterials;
-    std::unordered_map<int, int> duplicates;
-    
-    for (size_t i = 0; i < model.materials.size(); ++i) {
-        const auto& mat = model.materials[i];
-        
-        std::string key;
-        if (options.keepUniqueNames && !mat.name.empty()) {
-            key = mat.name + ";" + createMaterialHash(mat);
-        } else {
-            key = createMaterialHash(mat);
-        }
-        
-        if (uniqueMaterials.count(key)) {
-            duplicates[i] = uniqueMaterials[key];
-        } else {
-            uniqueMaterials[key] = i;
-        }
-    }
-    
-    if (duplicates.empty()) {
-        if (options.verbose) {
-            reportProgress("Materials: No duplicates found", 1.0, std::to_string(originalCount) + " total");
-        }
-        return;
-    }
-    
-    // Update references in meshes
-    for (auto& mesh : model.meshes) {
-        for (auto& prim : mesh.primitives) {
-            if (prim.material >= 0 && duplicates.count(prim.material)) {
-                prim.material = duplicates[prim.material];
-            }
-        }
-    }
-    
-    // Create index remapping
-    std::vector<int> indexRemap(model.materials.size());
-    int newIndex = 0;
-    for (size_t i = 0; i < model.materials.size(); ++i) {
-        if (duplicates.count(i)) {
-            indexRemap[i] = -1;
-        } else {
-            indexRemap[i] = newIndex++;
-        }
-    }
-    
-    // Remove duplicates
-    std::vector<tinygltf::Material> newMaterials;
-    newMaterials.reserve(model.materials.size() - duplicates.size());
-    for (size_t i = 0; i < model.materials.size(); ++i) {
-        if (!duplicates.count(i)) {
-            newMaterials.push_back(model.materials[i]);
-        }
-    }
-    model.materials = std::move(newMaterials);
-    
-    // Update indices
-    for (auto& mesh : model.meshes) {
-        for (auto& prim : mesh.primitives) {
-            if (prim.material >= 0) {
-                if (duplicates.count(prim.material)) {
-                    prim.material = indexRemap[duplicates[prim.material]];
-                } else {
-                    prim.material = indexRemap[prim.material];
-                }
-            }
-        }
-    }
-    
-    std::stringstream ss;
-    ss << "Materials: Merged " << duplicates.size() << " of " << originalCount
-       << " (" << model.materials.size() << " remaining)";
-    stats_ += ss.str() + "\n";
-    
-    if (options.verbose) {
-        std::cout << ss.str() << std::endl;
+
+    for (auto& texture : model.textures) {
+        update(texture.source);
     }
 }
 
-void GltfDedup::dedupTextures(tinygltf::Model& model, const Options& options) {
-    const size_t originalImageCount = model.images.size();
-    const size_t originalTextureCount = model.textures.size();
-    
-    auto reportProgress = [&](const std::string& message, double progress = -1.0, const std::string& details = "") {
-        if (options.progressReporter) {
-            options.progressReporter->report("dedupe-textures", message, progress, details);
-        } else if (options.verbose) {
-            std::cout << message;
-            if (!details.empty()) std::cout << " - " << details;
-            std::cout << std::endl;
+void applyTextureRemap(tinygltf::Model& model, const std::vector<int>& remap) {
+    auto update = [&](int& idx) {
+        if (idx >= 0 && idx < static_cast<int>(remap.size())) {
+            idx = remap[idx];
         }
     };
-    
-    reportProgress("Deduplicating images", 0.0, std::to_string(originalImageCount) + " total");
-    
-    // Deduplicate images first
-    std::unordered_map<int, int> imageDuplicates;
-    
-    for (size_t i = 0; i < model.images.size(); ++i) {
-        if (imageDuplicates.count(i)) continue;
-        
-        if (i % 100 == 0 && i > 0) {
-            double imgProgress = 0.3 * static_cast<double>(i) / model.images.size();
-            reportProgress("Processed " + std::to_string(i) + "/" + std::to_string(model.images.size()) + " images", imgProgress);
-        }
-        
-        const auto& imgA = model.images[i];
-        
-        for (size_t j = i + 1; j < model.images.size(); ++j) {
-            if (imageDuplicates.count(j)) continue;
-            
-            const auto& imgB = model.images[j];
-            
-            if (imgA.mimeType != imgB.mimeType) continue;
-            if (options.keepUniqueNames && imgA.name != imgB.name) continue;
-            if (imgA.width != imgB.width || imgA.height != imgB.height) continue;
-            
-            if (buffersEqual(imgA.image, imgB.image)) {
-                imageDuplicates[j] = i;
-            }
-        }
-    }
-    
-    // Update texture references to images
-    for (auto& texture : model.textures) {
-        if (texture.source >= 0 && imageDuplicates.count(texture.source)) {
-            texture.source = imageDuplicates[texture.source];
-        }
-    }
-    
-    // Create image index remapping
-    std::vector<int> imageIndexRemap(model.images.size());
-    int newImageIndex = 0;
-    for (size_t i = 0; i < model.images.size(); ++i) {
-        if (imageDuplicates.count(i)) {
-            imageIndexRemap[i] = -1;
-        } else {
-            imageIndexRemap[i] = newImageIndex++;
-        }
-    }
-    
-    // Remove duplicate images
-    std::vector<tinygltf::Image> newImages;
-    newImages.reserve(model.images.size() - imageDuplicates.size());
-    for (size_t i = 0; i < model.images.size(); ++i) {
-        if (!imageDuplicates.count(i)) {
-            newImages.push_back(model.images[i]);
-        }
-    }
-    model.images = std::move(newImages);
-    
-    // Update image indices in textures
-    for (auto& texture : model.textures) {
-        if (texture.source >= 0) {
-            if (imageDuplicates.count(texture.source)) {
-                texture.source = imageIndexRemap[imageDuplicates[texture.source]];
-            } else {
-                texture.source = imageIndexRemap[texture.source];
-            }
-        }
-    }
-    
-    // Now deduplicate textures
-    std::unordered_map<int, int> textureDuplicates;
-    
-    for (size_t i = 0; i < model.textures.size(); ++i) {
-        if (textureDuplicates.count(i)) continue;
-        
-        const auto& texA = model.textures[i];
-        
-        for (size_t j = i + 1; j < model.textures.size(); ++j) {
-            if (textureDuplicates.count(j)) continue;
-            
-            const auto& texB = model.textures[j];
-            
-            if (options.keepUniqueNames && texA.name != texB.name) continue;
-            if (texA.source != texB.source) continue;
-            if (texA.sampler != texB.sampler) continue;
-            
-            textureDuplicates[j] = i;
-        }
-    }
-    
-    // Update texture references in materials
-    auto updateTextureInfo = [&textureDuplicates](tinygltf::TextureInfo& info) {
-        if (info.index >= 0 && textureDuplicates.count(info.index)) {
-            info.index = textureDuplicates[info.index];
-        }
+
+    auto updateTextureInfo = [&](tinygltf::TextureInfo& info) {
+        update(info.index);
     };
-    
-    auto updateNormalTextureInfo = [&textureDuplicates](tinygltf::NormalTextureInfo& info) {
-        if (info.index >= 0 && textureDuplicates.count(info.index)) {
-            info.index = textureDuplicates[info.index];
-        }
+
+    auto updateNormal = [&](tinygltf::NormalTextureInfo& info) {
+        update(info.index);
     };
-    
-    auto updateOcclusionTextureInfo = [&textureDuplicates](tinygltf::OcclusionTextureInfo& info) {
-        if (info.index >= 0 && textureDuplicates.count(info.index)) {
-            info.index = textureDuplicates[info.index];
-        }
+
+    auto updateOcclusion = [&](tinygltf::OcclusionTextureInfo& info) {
+        update(info.index);
     };
-    
+
     for (auto& material : model.materials) {
         updateTextureInfo(material.pbrMetallicRoughness.baseColorTexture);
         updateTextureInfo(material.pbrMetallicRoughness.metallicRoughnessTexture);
-        updateNormalTextureInfo(material.normalTexture);
-        updateOcclusionTextureInfo(material.occlusionTexture);
+        updateNormal(material.normalTexture);
+        updateOcclusion(material.occlusionTexture);
         updateTextureInfo(material.emissiveTexture);
     }
-    
-    // Create texture index remapping
-    std::vector<int> textureIndexRemap(model.textures.size());
-    int newTextureIndex = 0;
-    for (size_t i = 0; i < model.textures.size(); ++i) {
-        if (textureDuplicates.count(i)) {
-            textureIndexRemap[i] = -1;
+}
+
+bool dedupAccessorsImpl(tinygltf::Model& model,
+                        const DedupOptions& options,
+                        DedupReport& report) {
+    report.original = model.accessors.size();
+    report.remaining = report.original;
+
+    if (report.original < 2) {
+        return false;
+    }
+
+    Reporter progress(options, "dedupe-accessors");
+    progress.log("Scanning accessors", 0.0, std::to_string(report.original) + " total");
+
+    struct BucketEntry {
+        uint64_t hash = 0;
+        int index = -1;
+    };
+
+    std::unordered_map<std::string, std::vector<BucketEntry>> buckets;
+    DuplicateMap duplicates;
+
+    for (size_t idx = 0; idx < model.accessors.size(); ++idx) {
+        const auto& accessor = model.accessors[idx];
+        const std::string metadata = accessorMetadata(accessor);
+        const uint64_t contentHash = accessorContentHash(model, accessor);
+
+        auto& bucket = buckets[metadata];
+        bool matched = false;
+        for (const auto& entry : bucket) {
+            if (entry.hash != contentHash) {
+                continue;
+            }
+            if (accessorsEqual(model, accessor, model.accessors[entry.index])) {
+                duplicates[static_cast<int>(idx)] = entry.index;
+                matched = true;
+                break;
+            }
+        }
+
+        if (!matched) {
+            bucket.push_back({contentHash, static_cast<int>(idx)});
+        }
+    }
+
+    report.removed = duplicates.size();
+    if (duplicates.empty()) {
+        progress.log("Accessors: no duplicates", 1.0, std::to_string(report.original) + " total");
+        return false;
+    }
+
+    const auto remap = buildRemap(model.accessors.size(), duplicates);
+    applyAccessorRemap(model, remap);
+    compactVector(model.accessors, duplicates);
+    report.remaining = model.accessors.size();
+
+    progress.log("Accessors deduplicated", 1.0, std::to_string(report.removed) + " merged");
+    return true;
+}
+
+bool dedupMaterialsImpl(tinygltf::Model& model,
+                        const DedupOptions& options,
+                        DedupReport& report) {
+    report.original = model.materials.size();
+    report.remaining = report.original;
+
+    if (report.original < 2) {
+        return false;
+    }
+
+    Reporter progress(options, "dedupe-materials");
+    progress.log("Scanning materials", 0.0, std::to_string(report.original) + " total");
+
+    std::unordered_map<std::string, int> seen;
+    DuplicateMap duplicates;
+
+    for (size_t idx = 0; idx < model.materials.size(); ++idx) {
+        const auto& material = model.materials[idx];
+        const std::string key = materialKey(material, options.keepUniqueNames);
+        auto [it, inserted] = seen.emplace(key, static_cast<int>(idx));
+        if (!inserted) {
+            duplicates[static_cast<int>(idx)] = it->second;
+        }
+    }
+
+    report.removed = duplicates.size();
+    if (duplicates.empty()) {
+        progress.log("Materials: no duplicates", 1.0, std::to_string(report.original) + " total");
+        return false;
+    }
+
+    const auto remap = buildRemap(model.materials.size(), duplicates);
+    applyMaterialRemap(model, remap);
+    compactVector(model.materials, duplicates);
+    report.remaining = model.materials.size();
+
+    progress.log("Materials deduplicated", 1.0, std::to_string(report.removed) + " merged");
+    return true;
+}
+
+bool dedupMeshesImpl(tinygltf::Model& model,
+                     const DedupOptions& options,
+                     DedupReport& report) {
+    report.original = model.meshes.size();
+    report.remaining = report.original;
+
+    if (report.original < 2) {
+        return false;
+    }
+
+    Reporter progress(options, "dedupe-meshes");
+    progress.log("Scanning meshes", 0.0, std::to_string(report.original) + " total");
+
+    std::unordered_map<std::string, int> seen;
+    DuplicateMap duplicates;
+
+    for (size_t idx = 0; idx < model.meshes.size(); ++idx) {
+        const std::string key = meshKey(model.meshes[idx], options.keepUniqueNames);
+        auto [it, inserted] = seen.emplace(key, static_cast<int>(idx));
+        if (!inserted) {
+            duplicates[static_cast<int>(idx)] = it->second;
+        }
+    }
+
+    report.removed = duplicates.size();
+    if (duplicates.empty()) {
+        progress.log("Meshes: no duplicates", 1.0, std::to_string(report.original) + " total");
+        return false;
+    }
+
+    const auto remap = buildRemap(model.meshes.size(), duplicates);
+    applyMeshRemap(model, remap);
+    compactVector(model.meshes, duplicates);
+    report.remaining = model.meshes.size();
+
+    progress.log("Meshes deduplicated", 1.0, std::to_string(report.removed) + " merged");
+    return true;
+}
+
+bool dedupTexturesImpl(tinygltf::Model& model,
+                       const DedupOptions& options,
+                       DedupReport& imageReport,
+                       DedupReport& textureReport) {
+    imageReport.original = model.images.size();
+    imageReport.remaining = imageReport.original;
+    textureReport.original = model.textures.size();
+    textureReport.remaining = textureReport.original;
+
+    bool changed = false;
+
+    Reporter imageProgress(options, "dedupe-images");
+    if (imageReport.original > 1) {
+        imageProgress.log("Scanning images", 0.0, std::to_string(imageReport.original) + " total");
+
+        struct BucketEntry {
+            uint64_t hash = 0;
+            int index = -1;
+        };
+
+        std::unordered_map<std::string, std::vector<BucketEntry>> buckets;
+        DuplicateMap duplicates;
+
+        for (size_t idx = 0; idx < model.images.size(); ++idx) {
+            const auto& image = model.images[idx];
+            const std::string key = imageKey(image, options.keepUniqueNames);
+            const uint64_t contentHash = hashBuffer(image.image.data(), image.image.size());
+
+            auto& bucket = buckets[key];
+            bool matched = false;
+            for (const auto& entry : bucket) {
+                if (entry.hash != contentHash) {
+                    continue;
+                }
+                if (buffersEqual(image.image, model.images[entry.index].image)) {
+                    duplicates[static_cast<int>(idx)] = entry.index;
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched) {
+                bucket.push_back({contentHash, static_cast<int>(idx)});
+            }
+        }
+
+        imageReport.removed = duplicates.size();
+        if (!duplicates.empty()) {
+            const auto remap = buildRemap(model.images.size(), duplicates);
+            applyImageRemap(model, remap);
+            compactVector(model.images, duplicates);
+            imageReport.remaining = model.images.size();
+            changed = true;
         } else {
-            textureIndexRemap[i] = newTextureIndex++;
+            imageProgress.log("Images: no duplicates", 1.0, std::to_string(imageReport.original) + " total");
         }
     }
-    
-    // Remove duplicate textures
-    std::vector<tinygltf::Texture> newTextures;
-    newTextures.reserve(model.textures.size() - textureDuplicates.size());
-    for (size_t i = 0; i < model.textures.size(); ++i) {
-        if (!textureDuplicates.count(i)) {
-            newTextures.push_back(model.textures[i]);
+
+    Reporter textureProgress(options, "dedupe-textures");
+    if (model.textures.size() > 1) {
+        textureProgress.log("Scanning textures", 0.0, std::to_string(textureReport.original) + " total");
+
+        std::unordered_map<std::string, int> seen;
+        DuplicateMap duplicates;
+
+        for (size_t idx = 0; idx < model.textures.size(); ++idx) {
+            const std::string key = textureKey(model.textures[idx], options.keepUniqueNames);
+            auto [it, inserted] = seen.emplace(key, static_cast<int>(idx));
+            if (!inserted) {
+                duplicates[static_cast<int>(idx)] = it->second;
+            }
+        }
+
+        textureReport.removed = duplicates.size();
+        if (!duplicates.empty()) {
+            const auto remap = buildRemap(model.textures.size(), duplicates);
+            applyTextureRemap(model, remap);
+            compactVector(model.textures, duplicates);
+            textureReport.remaining = model.textures.size();
+            changed = true;
+        } else {
+            textureProgress.log("Textures: no duplicates", 1.0, std::to_string(textureReport.original) + " total");
         }
     }
-    model.textures = std::move(newTextures);
-    
-    // Update texture indices in materials
-    auto updateTextureInfoFinal = [&textureIndexRemap, &textureDuplicates](tinygltf::TextureInfo& info) {
-        if (info.index >= 0) {
-            if (textureDuplicates.count(info.index)) {
-                info.index = textureIndexRemap[textureDuplicates[info.index]];
-            } else {
-                info.index = textureIndexRemap[info.index];
+
+    return changed;
+}
+
+std::string formatSummary(const char* label, const DedupReport& report) {
+    std::ostringstream stream;
+    stream << label << ": Merged " << report.removed << " of " << report.original
+           << " (" << report.remaining << " remaining)";
+    return stream.str();
+}
+
+} // namespace
+
+GltfDedup::GltfDedup() = default;
+GltfDedup::~GltfDedup() = default;
+
+bool GltfDedup::process(tinygltf::Model& model, const DedupOptions& options) {
+    error_.clear();
+    stats_.clear();
+
+    try {
+        if (options.dedupAccessors) {
+            DedupReport accessors;
+            if (dedupAccessorsImpl(model, options, accessors)) {
+                stats_ += formatSummary("Accessors", accessors) + '\n';
             }
         }
-    };
-    
-    auto updateNormalTextureInfoFinal = [&textureIndexRemap, &textureDuplicates](tinygltf::NormalTextureInfo& info) {
-        if (info.index >= 0) {
-            if (textureDuplicates.count(info.index)) {
-                info.index = textureIndexRemap[textureDuplicates[info.index]];
-            } else {
-                info.index = textureIndexRemap[info.index];
+
+        if (options.dedupTextures) {
+            DedupReport images;
+            DedupReport textures;
+            if (dedupTexturesImpl(model, options, images, textures)) {
+                if (images.removed > 0) {
+                    stats_ += formatSummary("Images", images) + '\n';
+                }
+                if (textures.removed > 0) {
+                    stats_ += formatSummary("Textures", textures) + '\n';
+                }
             }
         }
-    };
-    
-    auto updateOcclusionTextureInfoFinal = [&textureIndexRemap, &textureDuplicates](tinygltf::OcclusionTextureInfo& info) {
-        if (info.index >= 0) {
-            if (textureDuplicates.count(info.index)) {
-                info.index = textureIndexRemap[textureDuplicates[info.index]];
-            } else {
-                info.index = textureIndexRemap[info.index];
+
+        if (options.dedupMaterials) {
+            DedupReport materials;
+            if (dedupMaterialsImpl(model, options, materials)) {
+                stats_ += formatSummary("Materials", materials) + '\n';
             }
         }
-    };
-    
-    for (auto& material : model.materials) {
-        updateTextureInfoFinal(material.pbrMetallicRoughness.baseColorTexture);
-        updateTextureInfoFinal(material.pbrMetallicRoughness.metallicRoughnessTexture);
-        updateNormalTextureInfoFinal(material.normalTexture);
-        updateOcclusionTextureInfoFinal(material.occlusionTexture);
-        updateTextureInfoFinal(material.emissiveTexture);
-    }
-    
-    std::stringstream ss;
-    ss << "Images: Merged " << imageDuplicates.size() << " of " << originalImageCount
-       << " (" << model.images.size() << " remaining)\n";
-    ss << "Textures: Merged " << textureDuplicates.size() << " of " << originalTextureCount
-       << " (" << model.textures.size() << " remaining)";
-    stats_ += ss.str() + "\n";
-    
-    if (options.verbose) {
-        std::cout << ss.str() << std::endl;
+
+        if (options.dedupMeshes) {
+            DedupReport meshes;
+            if (dedupMeshesImpl(model, options, meshes)) {
+                stats_ += formatSummary("Meshes", meshes) + '\n';
+            }
+        }
+
+        return true;
+    } catch (const std::exception& ex) {
+        error_ = std::string("Deduplication failed: ") + ex.what();
+        return false;
     }
 }
 

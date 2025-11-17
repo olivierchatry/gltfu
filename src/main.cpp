@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
         
         // Deduplicate
         gltfu::GltfDedup deduper;
-        gltfu::GltfDedup::Options options;
+        gltfu::DedupOptions options;
         options.dedupAccessors = dedupAccessors;
         options.dedupMeshes = dedupMeshes;
         options.dedupMaterials = dedupMaterials;
@@ -1047,7 +1047,7 @@ int main(int argc, char** argv) {
             progress.report("optim", "Step 2: Deduplicating resources", 0.15);
             
             gltfu::GltfDedup deduper;
-            gltfu::GltfDedup::Options dedupOpts;
+            gltfu::DedupOptions dedupOpts;
             dedupOpts.dedupAccessors = true;
             dedupOpts.dedupMeshes = true;
             dedupOpts.dedupMaterials = true;

@@ -1,7 +1,7 @@
 #include "gltf_flatten.h"
+#include "math_utils.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <deque>
@@ -11,15 +11,6 @@
 
 namespace gltfu {
 namespace {
-
-using Matrix4 = std::array<double, 16>;
-
-constexpr Matrix4 kIdentityMatrix = {
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 1.0, 0.0,
-    0.0, 0.0, 0.0, 1.0
-};
 
 Matrix4 getNodeMatrix(const tinygltf::Node& node) {
     Matrix4 matrix = kIdentityMatrix;
@@ -76,22 +67,6 @@ Matrix4 getNodeMatrix(const tinygltf::Node& node) {
     matrix[15] = 1.0;
 
     return matrix;
-}
-
-Matrix4 multiplyMatrices(const Matrix4& a, const Matrix4& b) {
-    Matrix4 result{};
-
-    for (int row = 0; row < 4; ++row) {
-        for (int col = 0; col < 4; ++col) {
-            double sum = 0.0;
-            for (int k = 0; k < 4; ++k) {
-                sum += a[row + k * 4] * b[k + col * 4];
-            }
-            result[row + col * 4] = sum;
-        }
-    }
-
-    return result;
 }
 
 void setNodeMatrix(tinygltf::Node& node, const Matrix4& matrix) {
@@ -185,7 +160,7 @@ int GltfFlatten::process(tinygltf::Model& model, bool cleanup) {
         const int parent = parentMap[nodeIdx];
         if (parent >= 0) {
             computeWorld(parent);
-            worldMatrix[nodeIdx] = multiplyMatrices(worldMatrix[parent], local);
+            worldMatrix[nodeIdx] = multiply(worldMatrix[parent], local);
             depth[nodeIdx] = depth[parent] + 1;
             rootNode[nodeIdx] = rootNode[parent];
         } else {
