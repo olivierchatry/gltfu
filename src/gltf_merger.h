@@ -3,8 +3,6 @@
 
 #include "tiny_gltf.h"
 #include <string>
-#include <vector>
-#include <memory>
 
 namespace gltfu {
 
@@ -64,17 +62,14 @@ public:
     void clear();
 
 private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-    std::string errorMsg_;
+    bool mergeModelStreaming(tinygltf::Model&& model,
+                             bool keepScenesIndependent,
+                             bool defaultScenesOnly);
 
-    // Helper methods
-    bool mergeModel(tinygltf::Model&& model, bool mergeScenes);
-    bool mergeModelStreaming(tinygltf::Model&& model, bool keepScenesIndependent, bool defaultScenesOnly);
-    void updateIndices(tinygltf::Model& target, const tinygltf::Model& source,
-                      int nodeOffset, int meshOffset, int materialOffset,
-                      int textureOffset, int imageOffset, int samplerOffset,
-                      int accessorOffset, int bufferViewOffset, int bufferOffset);
+    tinygltf::Model mergedModel_;
+    tinygltf::TinyGLTF loader_;
+    bool firstModel_ = true;
+    std::string errorMsg_;
 };
 
 } // namespace gltfu
